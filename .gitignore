@@ -1,1 +1,5 @@
 database.db
+dir.py
+output.txt
+faiss.index
+id_map.json

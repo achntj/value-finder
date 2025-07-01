@@ -1,33 +1,19 @@
-import sqlite3
+# app.py
 import streamlit as st
+import sqlite3
 
-DATABASE = "database.db"
+st.set_page_config(page_title="WebScout", layout="centered")
+st.title("Your Smart Daily Digest")
 
-def get_top_posts(limit=20):
-    conn = sqlite3.connect(DATABASE)
-    cursor = conn.cursor()
-    cursor.execute("""
-        SELECT title, content, url, score 
-        FROM posts 
-        WHERE content IS NOT NULL AND score IS NOT NULL
-        ORDER BY score DESC
-        LIMIT ?
-    """, (limit,))
-    posts = cursor.fetchall()
-    conn.close()
-    return posts
+conn = sqlite3.connect("database.db")
+cursor = conn.cursor()
+cursor.execute(
+    "SELECT title, url, summary, score, source FROM posts WHERE score IS NOT NULL ORDER BY score DESC LIMIT 20"
+)
+posts = cursor.fetchall()
 
-def app():
-    st.title("Your Daily Digest")
-
-    posts = get_top_posts()
-
-    for idx, (title, content, url, score) in enumerate(posts):
-        st.markdown(f"### [{title}]({url})  ")
-        st.write(content)
-        st.caption(f"Score: {score:.3f}")
-        st.markdown("---")
-
-if __name__ == "__main__":
-    app()
-
+for title, url, summary, score, source in posts:
+    st.markdown(f"### [{title}]({url})")
+    st.markdown(f"**Source:** {source} | **Score:** {score:.2f}")
+    st.markdown(summary)
+    st.markdown("---")

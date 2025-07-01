@@ -1,34 +1,46 @@
+# embedding.py
 import sqlite3
-from sentence_transformers import SentenceTransformer
-import faiss
 import numpy as np
+import faiss
 import json
+from sentence_transformers import SentenceTransformer
 
 DATABASE = "database.db"
+EMBEDDING_MODEL = "all-MiniLM-L6-v2"
 INDEX_FILE = "faiss.index"
+ID_MAP_FILE = "id_map.json"
 
 def build_index():
+    model = SentenceTransformer(EMBEDDING_MODEL)
     conn = sqlite3.connect(DATABASE)
     cursor = conn.cursor()
-    cursor.execute("SELECT id, content FROM posts WHERE content IS NOT NULL")
+
+    cursor.execute("SELECT id, summary FROM posts WHERE summary IS NOT NULL")
     rows = cursor.fetchall()
 
-    model = SentenceTransformer("all-MiniLM-L6-v2")
-    embeddings = [model.encode(content) for _, content in rows]
-    ids = [post_id for post_id, _ in rows]
+    embeddings = []
+    ids = []
+    id_map = {}
 
-    embedding_dim = embeddings[0].shape[0]  # <-- Define embedding_dim here
+    for i, (post_id, summary) in enumerate(rows):
+        vec = model.encode(summary)
+        embeddings.append(vec)
+        ids.append(i)
+        id_map[i] = post_id
 
-    id_map = {i: post_id for i, post_id in enumerate(ids)}
-    id_to_faiss = list(id_map.keys())
+    if not embeddings:
+        print("No embeddings to index.")
+        return
 
-    index = faiss.IndexIDMap(faiss.IndexFlatL2(embedding_dim))
-    index.add_with_ids(np.array(embeddings), np.array(id_to_faiss, dtype="int64"))
-    
-    with open("id_map.json", "w") as f:
+    dim = len(embeddings[0])
+    index = faiss.IndexIDMap(faiss.IndexFlatL2(dim))
+    index.add_with_ids(np.array(embeddings).astype("float32"), np.array(ids))
+
+    faiss.write_index(index, INDEX_FILE)
+    with open(ID_MAP_FILE, "w") as f:
         json.dump(id_map, f)
 
-    conn.close()
+    print("Embedding index built.")
 
 if __name__ == "__main__":
     build_index()
