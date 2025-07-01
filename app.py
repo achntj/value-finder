@@ -1,22 +1,33 @@
-import streamlit as st
 import sqlite3
+import streamlit as st
 
 DATABASE = "database.db"
 
-def load_posts():
+def get_top_posts(limit=20):
     conn = sqlite3.connect(DATABASE)
     cursor = conn.cursor()
-    cursor.execute("SELECT title, content, url FROM posts ORDER BY created_at DESC")
+    cursor.execute("""
+        SELECT title, content, url, score 
+        FROM posts 
+        WHERE content IS NOT NULL AND score IS NOT NULL
+        ORDER BY score DESC
+        LIMIT ?
+    """, (limit,))
     posts = cursor.fetchall()
     conn.close()
     return posts
 
-st.title("Your Daily Digest")
+def app():
+    st.title("Your Daily Digest")
 
-posts = load_posts()
+    posts = get_top_posts()
 
-for title, content, url in posts:
-    st.header(title)
-    st.write(content)
-    st.markdown(f"[Read more]({url})", unsafe_allow_html=True)
+    for idx, (title, content, url, score) in enumerate(posts):
+        st.markdown(f"### [{title}]({url})  ")
+        st.write(content)
+        st.caption(f"Score: {score:.3f}")
+        st.markdown("---")
+
+if __name__ == "__main__":
+    app()
 
