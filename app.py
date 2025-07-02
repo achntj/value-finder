@@ -147,7 +147,7 @@ def flag_content(post_id, source, reason, severity):
 
 def main():
     st.set_page_config(page_title="WebScout", layout="centered", page_icon="🔍")
-    st.title("Your Smart Daily Digest")
+    st.title("The World, Filtered for You")
 
     conn = get_db_connection()
     debug_info = debug_database(conn)
