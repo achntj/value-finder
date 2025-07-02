@@ -4,3 +4,5 @@ output.txt
 faiss.index
 id_map.json
 __pycache__/*
+migrations.py
+update_schema.py

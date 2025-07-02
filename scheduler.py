@@ -1,102 +1,115 @@
 # scheduler.py
+import sqlite3
 import time
 from datetime import datetime, timedelta
 import subprocess
-import sqlite3
 import signal
 import sys
+import logging
 from config import INTEREST_CONFIG
 
+# Configure logging
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(levelname)s - %(message)s'
+)
+logger = logging.getLogger(__name__)
 
 class TaskScheduler:
     def __init__(self):
         self.running = True
         signal.signal(signal.SIGINT, self.handle_interrupt)
         signal.signal(signal.SIGTERM, self.handle_interrupt)
-
+        self.conn = sqlite3.connect("database.db")
+        
     def handle_interrupt(self, signum, frame):
-        print("\nReceived shutdown signal, finishing current task...")
+        logger.info("\nReceived shutdown signal")
         self.running = False
-
-    def get_last_run_time(self, task_name):
-        conn = sqlite3.connect("database.db")
-        cursor = conn.cursor()
-        cursor.execute(
-            """
-            CREATE TABLE IF NOT EXISTS scheduler_state (
-                task_name TEXT PRIMARY KEY,
-                last_run TIMESTAMP
-            )
-        """
-        )
-        cursor.execute(
-            "SELECT last_run FROM scheduler_state WHERE task_name = ?", (task_name,)
-        )
+        self.conn.close()
+        
+    def should_run_task(self, task_name, interval_minutes):
+        cursor = self.conn.cursor()
+        cursor.execute("""
+            SELECT last_run FROM scheduler_state 
+            WHERE task_name = ?
+        """, (task_name,))
         result = cursor.fetchone()
-        conn.close()
-        print(result)
-        return datetime.fromisoformat(result[0]) if result else None
-
-    def update_last_run_time(self, task_name):
-        conn = sqlite3.connect("database.db")
-        cursor = conn.cursor()
-        cursor.execute(
-            """
-            INSERT OR REPLACE INTO scheduler_state (task_name, last_run)
-            VALUES (?, ?)
-        """,
-            (task_name, datetime.now().isoformat()),
-        )
-        conn.commit()
-        conn.close()
-
-    def should_run_task(self, task_name, interval_hours):
-        last_run = self.get_last_run_time(task_name)
-        if not last_run:
+        
+        if not result:
             return True
-        return (datetime.now() - last_run) >= timedelta(hours=interval_hours)
-
-    def run_task(self, command, task_name, interval_hours):
-        if not self.should_run_task(task_name, interval_hours):
-            print(f"Skipping {task_name}, not due yet")
-            return
-
-        print(f"Running {task_name}...")
+            
+        last_run = datetime.fromisoformat(result[0])
+        return (datetime.now() - last_run) >= timedelta(minutes=interval_minutes)
+        
+    def update_last_run(self, task_name):
+        cursor = self.conn.cursor()
+        cursor.execute("""
+            INSERT OR REPLACE INTO scheduler_state 
+            (task_name, last_run)
+            VALUES (?, ?)
+        """, (task_name, datetime.now().isoformat()))
+        self.conn.commit()
+        
+    def run_task(self, command, task_name, interval_minutes):
+        if not self.should_run_task(task_name, interval_minutes):
+            logger.info(f"Skipping {task_name} - not due yet")
+            return False
+            
+        logger.info(f"Running {task_name}...")
         try:
             subprocess.run(command, check=True)
-            self.update_last_run_time(task_name)
+            self.update_last_run(task_name)
+            return True
         except subprocess.CalledProcessError as e:
-            print(f"Error running {task_name}: {e}")
-
+            logger.error(f"Task {task_name} failed: {e}")
+            return False
+            
+    def run_pipeline(self):
+        """Run the full processing pipeline"""
+        if not self.running:
+            return
+            
+        # Check if any task in pipeline needs to run
+        tasks = [
+            (["python", "crawler.py"], "crawler", 60),
+            (["python", "scorer.py"], "scorer", 60),
+            (["python", "llm_summarizer.py"], "summarizer", 60)
+        ]
+        
+        ran_any = False
+        for command, name, interval in tasks:
+            if self.run_task(command, name, interval):
+                ran_any = True
+                
+        return ran_any
+        
     def run(self):
-        print("Starting WebScout scheduler...")
+        logger.info("Starting WebScout scheduler")
+        
         while self.running:
-            now = datetime.now()
-            print(f"\n=== Scheduler cycle at {now} ===")
-
-            # Crawler - run hourly
-            self.run_task(["python", "crawler.py"], "crawler", 1)
-
-            # Scorer - run after crawler completes
-            self.run_task(["python", "scorer.py"], "scorer", 1)
-
-            # Summarizer - run in batches
-            self.run_task(["python", "llm_summarizer.py"], "summarizer", 1)
-
-            # Embedding index - run daily at 3 AM
-            if now.hour == 3:
-                self.run_task(["python", "embedding.py"], "embedding", 24)
-
-            print("Tasks completed. Waiting for next cycle...")
-
-            # Wait in smaller intervals to be more responsive to signals
-            for _ in range(60):  # Check every minute
-                if not self.running:
-                    break
+            try:
+                # Run the pipeline if needed
+                self.run_pipeline()
+                
+                # Daily tasks
+                if datetime.now().hour == 3:  # 3 AM
+                    self.run_task(
+                        ["python", "embedding.py"], 
+                        "embedding", 
+                        1440  # 24 hours
+                    )
+                
+                # Check every minute if we should run anything
+                for _ in range(60):
+                    if not self.running:
+                        break
+                    time.sleep(1)
+                    
+            except Exception as e:
+                logger.error(f"Scheduler error: {e}")
                 time.sleep(60)
-
 
 if __name__ == "__main__":
     scheduler = TaskScheduler()
     scheduler.run()
-    print("Scheduler shutdown complete.")
+    logger.info("Scheduler stopped")

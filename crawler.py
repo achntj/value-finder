@@ -21,13 +21,11 @@ TARGETED_SOURCES = {
     ],
     "productivity": [
         "https://news.ycombinator.com/",
-        "https://www.reddit.com/r/productivity/",
         "https://www.reddit.com/r/Zettelkasten/",
     ],
     "startups": [
         "https://www.indiehackers.com/",
         "https://news.ycombinator.com/",
-        "https://www.reddit.com/r/startups/",
     ],
     "philosophy": [
         "https://www.reddit.com/r/philosophy/",
@@ -37,7 +35,6 @@ TARGETED_SOURCES = {
     "writing": [
         "https://www.reddit.com/r/writing/",
         "https://news.ycombinator.com/",
-        "https://www.reddit.com/r/KeepWriting/",
     ],
     "markets": [
         "https://www.reddit.com/r/investing/",
@@ -46,7 +43,6 @@ TARGETED_SOURCES = {
     ],
     "serendipity": [
         "https://news.ycombinator.com/newest",
-        "https://www.reddit.com/r/all/",
         "https://www.reddit.com/r/Serendipity/",
     ],
 }

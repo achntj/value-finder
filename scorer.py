@@ -108,6 +108,8 @@ class ContentScorer:
         if not feedback:
             return
 
+        print("Feedback:", feedback)
+
         adjustments = {cat: [] for cat in self.categories}
 
         for topic, relevance, quality in feedback:
