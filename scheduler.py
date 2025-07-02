@@ -1,49 +1,102 @@
 # scheduler.py
 import time
-from datetime import datetime
+from datetime import datetime, timedelta
 import subprocess
 import sqlite3
+import signal
+import sys
 from config import INTEREST_CONFIG
 
 
-def run_scheduled_tasks():
-    """Run all tasks on a schedule"""
-    conn = sqlite3.connect("database.db")
-    cursor = conn.cursor()
+class TaskScheduler:
+    def __init__(self):
+        self.running = True
+        signal.signal(signal.SIGINT, self.handle_interrupt)
+        signal.signal(signal.SIGTERM, self.handle_interrupt)
 
-    while True:
-        now = datetime.now()
-        print(f"\n=== Running tasks at {now} ===")
+    def handle_interrupt(self, signum, frame):
+        print("\nReceived shutdown signal, finishing current task...")
+        self.running = False
 
-        # Check last crawl time
-        cursor.execute("SELECT MAX(created_at) FROM posts")
-        last_crawl = cursor.fetchone()[0]
+    def get_last_run_time(self, task_name):
+        conn = sqlite3.connect("database.db")
+        cursor = conn.cursor()
+        cursor.execute(
+            """
+            CREATE TABLE IF NOT EXISTS scheduler_state (
+                task_name TEXT PRIMARY KEY,
+                last_run TIMESTAMP
+            )
+        """
+        )
+        cursor.execute(
+            "SELECT last_run FROM scheduler_state WHERE task_name = ?", (task_name,)
+        )
+        result = cursor.fetchone()
+        conn.close()
+        print(result)
+        return datetime.fromisoformat(result[0]) if result else None
 
-        # Crawl every hour
-        if (
-            not last_crawl
-            or (now - datetime.strptime(last_crawl, "%Y-%m-%d %H:%M:%S.%f")).seconds
-            > 3600
-        ):
-            print("Running crawler...")
-            subprocess.run(["python", "crawler.py"])
+    def update_last_run_time(self, task_name):
+        conn = sqlite3.connect("database.db")
+        cursor = conn.cursor()
+        cursor.execute(
+            """
+            INSERT OR REPLACE INTO scheduler_state (task_name, last_run)
+            VALUES (?, ?)
+        """,
+            (task_name, datetime.now().isoformat()),
+        )
+        conn.commit()
+        conn.close()
 
-        # Score new content immediately after crawling
-        print("Running scorer...")
-        subprocess.run(["python", "scorer.py"])
+    def should_run_task(self, task_name, interval_hours):
+        last_run = self.get_last_run_time(task_name)
+        if not last_run:
+            return True
+        return (datetime.now() - last_run) >= timedelta(hours=interval_hours)
 
-        # Summarize in batches
-        print("Running summarizer...")
-        subprocess.run(["python", "llm_summarizer.py"])
+    def run_task(self, command, task_name, interval_hours):
+        if not self.should_run_task(task_name, interval_hours):
+            print(f"Skipping {task_name}, not due yet")
+            return
 
-        # Build embedding index daily
-        if now.hour == 3:  # 3 AM
-            print("Building embedding index...")
-            subprocess.run(["python", "embedding.py"])
+        print(f"Running {task_name}...")
+        try:
+            subprocess.run(command, check=True)
+            self.update_last_run_time(task_name)
+        except subprocess.CalledProcessError as e:
+            print(f"Error running {task_name}: {e}")
 
-        print("Tasks completed. Waiting for next cycle...")
-        time.sleep(3600)  # Wait 1 hour
+    def run(self):
+        print("Starting WebScout scheduler...")
+        while self.running:
+            now = datetime.now()
+            print(f"\n=== Scheduler cycle at {now} ===")
+
+            # Crawler - run hourly
+            self.run_task(["python", "crawler.py"], "crawler", 1)
+
+            # Scorer - run after crawler completes
+            self.run_task(["python", "scorer.py"], "scorer", 1)
+
+            # Summarizer - run in batches
+            self.run_task(["python", "llm_summarizer.py"], "summarizer", 1)
+
+            # Embedding index - run daily at 3 AM
+            if now.hour == 3:
+                self.run_task(["python", "embedding.py"], "embedding", 24)
+
+            print("Tasks completed. Waiting for next cycle...")
+
+            # Wait in smaller intervals to be more responsive to signals
+            for _ in range(60):  # Check every minute
+                if not self.running:
+                    break
+                time.sleep(60)
 
 
 if __name__ == "__main__":
-    run_scheduled_tasks()
+    scheduler = TaskScheduler()
+    scheduler.run()
+    print("Scheduler shutdown complete.")

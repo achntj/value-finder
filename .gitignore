@@ -3,3 +3,4 @@ dir.py
 output.txt
 faiss.index
 id_map.json
+__pycache__/*

@@ -251,46 +251,87 @@ def scrape_reddit_subreddit(conn, subreddit="all", limit=20):
 
 
 def scrape_arxiv(conn):
-    print("Scraping arXiv for AI papers...")
-    url = "http://arxiv.org/list/cs.AI/recent"
-    res = requests.get(url, headers=HEADERS)
+    logger.info("Scraping arXiv for AI papers...")
+    url = "https://arxiv.org/list/cs.AI/recent"
+    try:
+        res = requests.get(url, headers=HEADERS, timeout=15)
+        res.raise_for_status()
 
-    if res.status_code != 200:
-        print(f"Error fetching arXiv: {res.status_code}")
-        return
+        soup = BeautifulSoup(res.text, "html.parser")
+        papers = soup.select("dt + dd")  # Get all dd elements following dt
 
-    soup = BeautifulSoup(res.text, "html.parser")
-    papers = soup.find_all("div", class_="meta")
+        if not papers:
+            logger.warning("No papers found on arXiv page")
+            return
 
-    for paper in papers[:10]:  # Limit to 10 papers
-        title = (
-            paper.find("div", class_="list-title").text.replace("Title: ", "").strip()
-        )
-        authors = (
-            paper.find("div", class_="list-authors")
-            .text.replace("Authors: ", "")
-            .strip()
-        )
-        abstract = paper.find("p", class_="mathjax").text.strip()
-        paper_id = (
-            paper.find("div", class_="list-identifier").text.strip().split(" ")[0]
-        )
-        paper_url = f"https://arxiv.org/abs/{paper_id.split(':')[-1]}"
+        for paper in papers[:10]:  # Limit to 10 papers
+            try:
+                # Get the preceding dt element which contains the ID and links
+                dt = paper.find_previous("dt")
+                if not dt:
+                    continue
 
-        content = f"{title}\n\nAuthors: {authors}\n\nAbstract: {abstract}"
+                # Extract paper ID and URL
+                paper_link = dt.find("a", href=lambda x: x and "/abs/" in x)
+                if not paper_link:
+                    continue
 
-        post = {
-            "id": paper_id,
-            "title": title,
-            "url": paper_url,
-            "content": content,
-            "source": "arxiv",
-            "created_at": datetime.datetime.utcnow(),
-        }
+                paper_id = paper_link.get("id")
+                paper_url = f"https://arxiv.org{paper_link['href']}"
 
-        if not post_exists(conn, paper_id):
-            save_post(conn, post)
-            print(f"Saved arXiv paper: {title[:60]}...")
+                # Extract title
+                title_tag = paper.find("div", class_="list-title")
+                if not title_tag:
+                    continue
+                title = title_tag.text.replace("Title:", "").strip()
+
+                # Extract authors
+                authors_tag = paper.find("div", class_="list-authors")
+                authors = (
+                    authors_tag.text.replace("Authors:", "").strip()
+                    if authors_tag
+                    else "Unknown"
+                )
+
+                # Extract abstract - look in both meta and abstract div
+                abstract = ""
+                abstract_tag = paper.find("p", class_="mathjax")
+                if not abstract_tag:
+                    abstract_tag = paper.find("div", class_="abstract")
+                if abstract_tag:
+                    abstract = abstract_tag.text.replace("Abstract:", "").strip()
+
+                # Extract subjects/categories
+                subjects_tag = paper.find("div", class_="list-subjects")
+                subjects = (
+                    subjects_tag.text.replace("Subjects:", "").strip()
+                    if subjects_tag
+                    else ""
+                )
+
+                content = f"Title: {title}\n\nAuthors: {authors}\n\nSubjects: {subjects}\n\nAbstract: {abstract or 'No abstract available'}"
+
+                post = {
+                    "id": paper_id,
+                    "title": title,
+                    "url": paper_url,
+                    "content": content,
+                    "source": "arxiv",
+                    "created_at": datetime.datetime.utcnow(),
+                }
+
+                if not post_exists(conn, paper_id):
+                    save_post(conn, post)
+                    logger.info(f"Saved arXiv paper: {title[:60]}...")
+                else:
+                    logger.debug(f"Skipping existing paper: {title[:60]}...")
+
+            except Exception as e:
+                logger.error(f"Error processing arXiv paper: {str(e)}")
+                continue
+
+    except Exception as e:
+        logger.error(f"Failed to scrape arXiv: {str(e)}")
 
 
 def scrape_indie_hackers(conn):
