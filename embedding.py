@@ -4,44 +4,70 @@ import numpy as np
 import faiss
 import json
 from sentence_transformers import SentenceTransformer
+from config import INTEREST_CONFIG
 
 DATABASE = "database.db"
 EMBEDDING_MODEL = "all-MiniLM-L6-v2"
 INDEX_FILE = "faiss.index"
 ID_MAP_FILE = "id_map.json"
 
-def build_index():
-    model = SentenceTransformer(EMBEDDING_MODEL)
-    conn = sqlite3.connect(DATABASE)
-    cursor = conn.cursor()
 
-    cursor.execute("SELECT id, summary FROM posts WHERE summary IS NOT NULL")
-    rows = cursor.fetchall()
+class EmbeddingIndexer:
+    def __init__(self):
+        self.model = SentenceTransformer(EMBEDDING_MODEL)
+        self.conn = sqlite3.connect(DATABASE)
 
-    embeddings = []
-    ids = []
-    id_map = {}
+    def build_index(self):
+        """Build or update the FAISS index"""
+        cursor = self.conn.cursor()
+        cursor.execute(
+            """
+            SELECT id, summary, score FROM posts 
+            WHERE summary IS NOT NULL
+            ORDER BY score DESC
+            LIMIT 1000  # Only index top content
+        """
+        )
+        rows = cursor.fetchall()
 
-    for i, (post_id, summary) in enumerate(rows):
-        vec = model.encode(summary)
-        embeddings.append(vec)
-        ids.append(i)
-        id_map[i] = post_id
+        if not rows:
+            print("No posts to index.")
+            return
 
-    if not embeddings:
-        print("No embeddings to index.")
-        return
+        # Prepare embeddings
+        embeddings = []
+        ids = []
+        id_map = {}
 
-    dim = len(embeddings[0])
-    index = faiss.IndexIDMap(faiss.IndexFlatL2(dim))
-    index.add_with_ids(np.array(embeddings).astype("float32"), np.array(ids))
+        for i, (post_id, summary, score) in enumerate(rows):
+            vec = self.model.encode(summary)
+            embeddings.append(vec)
+            ids.append(i)
+            id_map[i] = (post_id, score)  # Store both ID and score
 
-    faiss.write_index(index, INDEX_FILE)
-    with open(ID_MAP_FILE, "w") as f:
-        json.dump(id_map, f)
+        dim = len(embeddings[0])
 
-    print("Embedding index built.")
+        # Try to load existing index to update
+        try:
+            index = faiss.read_index(INDEX_FILE)
+            print("Loaded existing index to update.")
+        except:
+            index = faiss.IndexIDMap(faiss.IndexFlatL2(dim))
+            print("Created new index.")
+
+        index.add_with_ids(np.array(embeddings).astype("float32"), np.array(ids))
+
+        # Save index and mappings
+        faiss.write_index(index, INDEX_FILE)
+        with open(ID_MAP_FILE, "w") as f:
+            json.dump(id_map, f)
+
+        print(f"Embedding index built with {len(embeddings)} posts.")
+
+    def __del__(self):
+        self.conn.close()
+
 
 if __name__ == "__main__":
-    build_index()
-
+    indexer = EmbeddingIndexer()
+    indexer.build_index()
