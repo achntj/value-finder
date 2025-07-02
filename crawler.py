@@ -413,28 +413,5 @@ def scrape_indie_hackers(conn):
 
 
 if __name__ == "__main__":
-    # Initialize database
-    conn = sqlite3.connect(DATABASE)
-    cursor = conn.cursor()
-    cursor.execute(
-        """
-        CREATE TABLE IF NOT EXISTS posts (
-            id TEXT PRIMARY KEY,
-            title TEXT,
-            url TEXT,
-            content TEXT,
-            summary TEXT,
-            source TEXT,
-            topic TEXT,
-            score REAL,
-            embedding BLOB,
-            created_at TIMESTAMP,
-            last_updated TIMESTAMP
-        )
-    """
-    )
-    conn.commit()
-    conn.close()
-
     # Run targeted scraping
     scrape_targeted_sources()

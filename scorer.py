@@ -158,21 +158,23 @@ class ContentScorer:
     def apply_feedback_adjustments(self):
         cursor = self.conn.cursor()
 
-        # Process regular feedback
+        # Process negative feedback (for penalties)
         cursor.execute(
             """
-            SELECT p.topic, f.relevance, f.quality 
+            SELECT p.topic, f.quality, f.notes
             FROM feedback f
             JOIN posts p ON f.post_id = p.id
             WHERE f.timestamp > datetime('now', '-7 days')
-        """
+            AND f.rating_type = 'negative'
+            AND f.quality IS NOT NULL
+            """
         )
-        feedback = cursor.fetchall()
+        negative_feedback = cursor.fetchall()
 
-        if feedback:
+        if negative_feedback:
             adjustments = {cat: [] for cat in self.categories}
 
-            for topic, relevance, quality in feedback:
+            for topic, quality, notes in negative_feedback:
                 try:
                     if isinstance(topic, str):
                         topic_idx = self.category_keys.index(topic)
@@ -180,29 +182,77 @@ class ContentScorer:
                         topic_idx = int(topic)
 
                     cat = self.category_keys[topic_idx]
-                    score = (float(relevance) + float(quality)) / 6.0
-                    adjustments[cat].append(score)
+                    # Convert quality (0-2 scale) to 0-1 range
+                    normalized_quality = float(quality) / 2.0
+                    adjustments[cat].append(normalized_quality)
                 except (ValueError, IndexError) as e:
-                    print(f"Warning: Invalid topic '{topic}': {e}")
+                    logger.warning(f"Invalid topic '{topic}' in feedback: {e}")
                     continue
 
-            for cat, scores in adjustments.items():
-                if scores:
-                    avg_score = np.mean(scores)
+            for cat, qualities in adjustments.items():
+                if qualities:
+                    avg_quality = np.mean(qualities)
                     current_weight = float(self.categories[cat]["weight"])
-                    new_weight = current_weight * (
-                        1 + LEARNING_RATE * (avg_score - 0.5)
-                    )
+                    # Decrease weight for negative feedback (0.8-1.0 factor)
+                    new_weight = current_weight * (0.8 + (0.2 * (1 - avg_quality)))
 
                     cursor.execute(
                         """
                         INSERT OR REPLACE INTO interest_profile 
                         (category, current_weight, last_updated)
                         VALUES (?, ?, ?)
-                    """,
+                        """,
                         (cat, new_weight, datetime.now().isoformat()),
                     )
 
+        # Process positive feedback (for rewards)
+        cursor.execute(
+            """
+            SELECT p.topic, f.quality
+            FROM feedback f
+            JOIN posts p ON f.post_id = p.id
+            WHERE f.timestamp > datetime('now', '-7 days')
+            AND f.rating_type = 'positive'
+            AND f.quality IS NOT NULL
+            """
+        )
+        positive_feedback = cursor.fetchall()
+
+        if positive_feedback:
+            positive_adjustments = {cat: [] for cat in self.categories}
+
+            for topic, quality in positive_feedback:
+                try:
+                    if isinstance(topic, str):
+                        topic_idx = self.category_keys.index(topic)
+                    else:
+                        topic_idx = int(topic)
+
+                    cat = self.category_keys[topic_idx]
+                    # Convert quality (0-2 scale) to 0-1 range
+                    normalized_quality = float(quality) / 2.0
+                    positive_adjustments[cat].append(normalized_quality)
+                except (ValueError, IndexError) as e:
+                    logger.warning(f"Invalid topic '{topic}' in feedback: {e}")
+                    continue
+
+            for cat, qualities in positive_adjustments.items():
+                if qualities:
+                    avg_quality = np.mean(qualities)
+                    current_weight = float(self.categories[cat]["weight"])
+                    # Increase weight for positive feedback (1.0-1.2 factor)
+                    new_weight = current_weight * (1.0 + (0.2 * avg_quality))
+
+                    cursor.execute(
+                        """
+                        INSERT OR REPLACE INTO interest_profile 
+                        (category, current_weight, last_updated)
+                        VALUES (?, ?, ?)
+                        """,
+                        (cat, new_weight, datetime.now().isoformat()),
+                    )
+
+        # Rest of the method (flagged content processing) remains the same...
         # Process flagged content patterns
         cursor.execute(
             """
@@ -212,7 +262,7 @@ class ContentScorer:
             WHERE fc.timestamp > datetime('now', '-7 days')
             GROUP BY p.topic, fc.reason
             HAVING flag_count > 2
-        """
+            """
         )
         flag_patterns = cursor.fetchall()
 
@@ -234,7 +284,7 @@ class ContentScorer:
                     (cat,),
                 )
             except (ValueError, IndexError) as e:
-                print(f"Warning: Invalid topic '{topic}' in flag patterns: {e}")
+                logger.warning(f"Invalid topic '{topic}' in flag patterns: {e}")
 
         self.conn.commit()
 

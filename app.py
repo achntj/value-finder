@@ -5,7 +5,6 @@ from datetime import datetime
 import subprocess
 import time
 from config import INTEREST_CONFIG, FEEDBACK_OPTIONS
-import migrations
 
 # Category mapping
 CATEGORY_MAP = {
@@ -258,15 +257,31 @@ def main():
                         st.rerun()
 
                 # Unified rating form
-                with st.form(key=f"rating_{post_id}"):
-                    rating = st.radio(
+                # Store the rating choice in session state to maintain UI consistency
+                if f"rating_{post_id}" not in st.session_state:
+                    st.session_state[f"rating_{post_id}"] = None
+
+                # Unified rating form
+                with st.form(key=f"rating_form_{post_id}"):
+                    # Get or update the rating choice
+                    rating_choice = st.radio(
                         "Rate this content:",
                         options=["👍 Good", "👎 Bad"],
                         horizontal=True,
-                        key=f"rating_choice_{post_id}"
+                        key=f"rating_input_{post_id}",
+                        index=0 if st.session_state[f"rating_{post_id}"] != "👎 Bad" else 1
                     )
-
-                    if rating == "👎 Bad":
+                    
+                    # Update session state when rating changes
+                    if rating_choice != st.session_state[f"rating_{post_id}"]:
+                        st.session_state[f"rating_{post_id}"] = rating_choice
+                        st.rerun()  # Needed to immediately update the form
+                    
+                    # Fields that always appear
+                    notes = st.text_area("Additional comments (optional)", key=f"notes_{post_id}")
+                    
+                    # Conditional fields for negative feedback
+                    if st.session_state[f"rating_{post_id}"] == "👎 Bad":
                         reason = st.selectbox(
                             "What was wrong?",
                             ["Ad/Sponsored", "Low Quality", "Off-Topic", "Misleading"],
@@ -278,24 +293,32 @@ def main():
                             key=f"severity_{post_id}"
                         )
                     else:
+                        # Fields for positive feedback
                         quality = st.radio(
                             "Quality rating",
                             FEEDBACK_OPTIONS["quality"],
                             key=f"qual_{post_id}",
                             horizontal=True
                         )
-
-                    notes = st.text_area("Additional comments (optional)", key=f"notes_{post_id}")
-
+                    
                     if st.form_submit_button("Submit Rating"):
-                        if rating == "👎 Bad":
+                        if st.session_state[f"rating_{post_id}"] == "👎 Bad":
                             # Handle negative rating (flag content)
-                            print(f"Flagging content {post_id}")
                             flag_content(post_id, source, reason, severity)
+                            
+                            # Also record as negative feedback
+                            cursor.execute(
+                                """
+                                INSERT INTO feedback 
+                                (post_id, quality, notes, rating_type)
+                                VALUES (?, ?, ?, ?)
+                                """,
+                                (post_id, 0, notes, "negative"),
+                            )
+                            conn.commit()
                             st.success("Thanks for your feedback - content has been flagged")
                         else:
                             # Handle positive rating (record feedback)
-                            print(f"Recording positive feedback for {post_id}")
                             qual_score = FEEDBACK_OPTIONS["quality"].index(quality)
                             cursor.execute(
                                 """
@@ -307,10 +330,11 @@ def main():
                             )
                             conn.commit()
                             st.success("Thanks for your feedback!")
-
+                        
+                        # Clear the rating state after successful submission
+                        st.session_state[f"rating_{post_id}"] = None
                         time.sleep(1)
                         st.rerun()
-
     conn.close()
 
 
