@@ -8,15 +8,20 @@ import requests
 from bs4 import BeautifulSoup
 import random
 from config import INTEREST_CONFIG
+import logging
+
+# Configure logging
+logging.basicConfig(
+    level=logging.INFO, format="%(asctime)s - %(name)s - %(levelname)s - %(message)s"
+)
+logger = logging.getLogger(__name__)
 
 DATABASE = "database.db"
 HEADERS = {"User-Agent": "Mozilla/5.0 (compatible; WebScout/1.0)"}
-CRAWL_INTERVAL = 3600  # 1 hour between crawls
 
 TARGETED_SOURCES = {
     "ai_tech": [
         "https://arxiv.org/list/cs.AI/recent",
-        "https://lobste.rs/t/ai",
         "https://news.ycombinator.com/",
     ],
     "productivity": [
@@ -24,7 +29,6 @@ TARGETED_SOURCES = {
         "https://www.reddit.com/r/Zettelkasten/",
     ],
     "startups": [
-        "https://www.indiehackers.com/",
         "https://news.ycombinator.com/",
     ],
     "philosophy": [
@@ -46,6 +50,42 @@ TARGETED_SOURCES = {
         "https://www.reddit.com/r/Serendipity/",
     ],
 }
+
+SOURCE_PENALTY_THRESHOLD = 0.6  # Minimum source reliability score
+FLAGGED_SEVERITY_THRESHOLD = 3  # Minimum severity to block content
+
+
+def should_block_content(url, source):
+    conn = sqlite3.connect(DATABASE)
+    cursor = conn.cursor()
+
+    # Check source penalties
+    cursor.execute(
+        """
+        SELECT 1 FROM source_penalties 
+        WHERE source = ? AND penalty_score < ?
+    """,
+        (source, SOURCE_PENALTY_THRESHOLD),
+    )
+    if cursor.fetchone():
+        conn.close()
+        return True
+
+    # Check URL patterns from flagged content
+    cursor.execute(
+        """
+        SELECT 1 FROM flagged_content fc
+        JOIN posts p ON fc.post_id = p.id
+        WHERE p.url = ? AND fc.severity >= ?
+    """,
+        (url, FLAGGED_SEVERITY_THRESHOLD),
+    )
+    if cursor.fetchone():
+        conn.close()
+        return True
+
+    conn.close()
+    return False
 
 
 def extract_article_text(url):
@@ -81,6 +121,9 @@ def post_exists(conn, post_id):
 
 
 def save_post(conn, post):
+    if should_block_content(post["url"], post["source"]):
+        logger.warning(f"Blocked penalized content: {post['url']}")
+        return
     cursor = conn.cursor()
     cursor.execute(
         """
@@ -109,9 +152,10 @@ def scrape_targeted_sources():
     sources = TARGETED_SOURCES[category]
 
     print(f"Scraping sources for category: {category}")
+    print(sources)
 
     for source in sources:
-        if "hackernews" in source:
+        if "ycombinator" in source:
             scrape_hacker_news(conn, limit=10)
         elif "reddit" in source:
             subreddit = source.split("/")[-2] if "/" in source else "all"

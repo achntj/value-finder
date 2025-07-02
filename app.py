@@ -30,18 +30,25 @@ def debug_database(conn):
     debug_info = {"status": True, "messages": [], "stats": {}}
 
     try:
-        # Check if posts table exists
-        cursor.execute(
-            "SELECT name FROM sqlite_master WHERE type='table' AND name='posts'"
-        )
-        if not cursor.fetchone():
-            debug_info["status"] = False
-            debug_info["messages"].append("Posts table doesn't exist in the database!")
-            return debug_info
+        # Check required tables exist
+        required_tables = ['posts', 'flagged_content', 'source_penalties']
+        for table in required_tables:
+            cursor.execute(
+                f"SELECT name FROM sqlite_master WHERE type='table' AND name='{table}'"
+            )
+            if not cursor.fetchone():
+                debug_info["status"] = False
+                debug_info["messages"].append(f"Missing table: {table}")
 
         # Get database stats
         cursor.execute("SELECT COUNT(*) FROM posts")
         debug_info["stats"]["total_posts"] = cursor.fetchone()[0]
+
+        cursor.execute("""
+            SELECT COUNT(*) FROM posts p
+            JOIN flagged_content fc ON p.id = fc.post_id
+        """)
+        debug_info["stats"]["flagged_posts"] = cursor.fetchone()[0]
 
         cursor.execute("SELECT COUNT(*) FROM posts WHERE score IS NOT NULL")
         debug_info["stats"]["scored_posts"] = cursor.fetchone()[0]
@@ -67,16 +74,6 @@ def debug_database(conn):
     return debug_info
 
 
-def run_pipeline():
-    with st.spinner("Running full processing pipeline..."):
-        subprocess.run(["python", "crawler.py"])
-        subprocess.run(["python", "scorer.py"])
-        subprocess.run(["python", "llm_summarizer.py"])
-        st.success("Pipeline completed successfully!")
-        time.sleep(1)
-        st.rerun()
-
-
 def reset_scheduler():
     conn = get_db_connection()
     cursor = conn.cursor()
@@ -89,26 +86,65 @@ def reset_scheduler():
 def cleanup_database():
     conn = get_db_connection()
     cursor = conn.cursor()
-    cursor.execute("DELETE FROM posts WHERE is_favorite = 0")
-    cursor.execute("DELETE FROM feedback")
-    cursor.execute("DELETE FROM interest_profile")
-
-    for category, config in INTEREST_CONFIG["categories"].items():
-        cursor.execute(
-            """
-            INSERT OR REPLACE INTO interest_profile 
-            (category, current_weight, last_updated)
-            VALUES (?, ?, ?)
-        """,
-            (category, config["weight"], datetime.now().isoformat()),
-        )
-
+    deleted = cursor.execute("DELETE FROM posts WHERE is_favorite = 0").rowcount
     conn.commit()
     conn.close()
-    st.success("Database cleaned up - only favorites kept")
+    st.success(f"Cleaned up {deleted} non-favorite posts")
     time.sleep(1)
     st.rerun()
 
+
+def flag_content(post_id, source, reason, severity):
+    conn = get_db_connection()
+    cursor = conn.cursor()
+
+    try:
+        # First check if already flagged
+        cursor.execute(
+            "SELECT 1 FROM flagged_content WHERE post_id = ?", 
+            (post_id,)
+        )
+        if cursor.fetchone():
+            st.warning("This content was already flagged")
+            conn.close()
+            return False
+
+        # Flag the content
+        cursor.execute(
+            """
+            INSERT INTO flagged_content 
+            (post_id, reason, severity, timestamp)
+            VALUES (?, ?, ?, ?)
+            """,
+            (post_id, reason, severity, datetime.now().isoformat()),
+        )
+
+        # Apply immediate score penalty
+        penalty = 0.7 if severity >= 2 else 0.9
+        cursor.execute(
+            "UPDATE posts SET score = score * ? WHERE id = ?",
+            (penalty, post_id),
+        )
+
+        # Penalize the source
+        cursor.execute(
+            """
+            INSERT OR REPLACE INTO source_penalties 
+            (source, penalty_score, last_flagged)
+            VALUES (?, ?, ?)
+            """,
+            (source, 0.8, datetime.now().isoformat()),
+        )
+
+        conn.commit()
+        st.success("Content flagged and source penalized!")
+        return True
+    except Exception as e:
+        conn.rollback()
+        st.error(f"Error flagging content: {e}")
+        return False
+    finally:
+        conn.close()
 
 def main():
     st.set_page_config(page_title="WebScout", layout="centered", page_icon="🔍")
@@ -119,8 +155,6 @@ def main():
 
     with st.sidebar:
         st.header("Controls")
-        if st.button("🔄 Run Pipeline Now"):
-            run_pipeline()
         if st.button("⏱️ Reset Scheduler"):
             reset_scheduler()
         if st.button("🧹 Cleanup Database"):
@@ -138,7 +172,7 @@ def main():
             cols[0].metric("Total Posts", debug_info["stats"]["total_posts"])
             cols[1].metric("Scored Posts", debug_info["stats"]["scored_posts"])
             cols[0].metric("Favorites", debug_info["stats"]["favorite_posts"])
-            cols[1].metric("Feedback Entries", debug_info["stats"]["feedback_entries"])
+            cols[1].metric("Flagged", debug_info["stats"]["flagged_posts"])
             st.caption(
                 f"Sources: {debug_info['stats']['unique_sources']} | Topics: {debug_info['stats']['unique_topics']}"
             )
@@ -157,26 +191,41 @@ def main():
             default=list(INTEREST_CONFIG["source_weights"].keys()),
         )
         show_favorites = st.checkbox("Show Favorites Only", False)
+        hide_flagged = st.checkbox("Hide Flagged Content", True)
 
     # Convert selected display names to internal topics
     selected_topics = [CATEGORY_MAP[name] for name in selected_categories]
 
     # Build query
-    query = "SELECT id, title, url, summary, score, source, topic, is_favorite FROM posts WHERE score >= ?"
+    query = """
+        SELECT p.id, p.title, p.url, p.summary, p.score, 
+               p.source, p.topic, p.is_favorite 
+        FROM posts p
+        WHERE p.score >= ?
+    """
     params = [min_score]
 
+    # Add filters
     if sources:
-        query += " AND source IN (" + ",".join(["?"] * len(sources)) + ")"
+        query += " AND p.source IN (" + ",".join(["?"] * len(sources)) + ")"
         params.extend(sources)
 
     if selected_topics:
-        query += " AND topic IN (" + ",".join(["?"] * len(selected_topics)) + ")"
+        query += " AND p.topic IN (" + ",".join(["?"] * len(selected_topics)) + ")"
         params.extend(selected_topics)
 
     if show_favorites:
-        query += " AND is_favorite = 1"
+        query += " AND p.is_favorite = 1"
 
-    query += " ORDER BY score DESC LIMIT 50"
+    if hide_flagged:
+        query += """
+            AND NOT EXISTS (
+                SELECT 1 FROM flagged_content fc 
+                WHERE fc.post_id = p.id
+            )
+        """
+
+    query += " ORDER BY p.score DESC LIMIT 50"
 
     cursor = conn.cursor()
     cursor.execute(query, params)
@@ -208,34 +257,59 @@ def main():
                         conn.commit()
                         st.rerun()
 
-                # Feedback form
-                with st.form(key=f"feedback_{post_id}"):
-                    st.write("How was this recommendation?")
-                    relevance = st.radio(
-                        "Relevance", FEEDBACK_OPTIONS["relevance"], key=f"rel_{post_id}"
+                # Unified rating form
+                with st.form(key=f"rating_{post_id}"):
+                    rating = st.radio(
+                        "Rate this content:",
+                        options=["👍 Good", "👎 Bad"],
+                        horizontal=True,
+                        key=f"rating_choice_{post_id}"
                     )
-                    quality = st.radio(
-                        "Quality", FEEDBACK_OPTIONS["quality"], key=f"qual_{post_id}"
-                    )
-                    novelty = st.radio(
-                        "Novelty", FEEDBACK_OPTIONS["novelty"], key=f"nov_{post_id}"
-                    )
-                    notes = st.text_area("Additional notes", key=f"notes_{post_id}")
 
-                    if st.form_submit_button("Submit Feedback"):
-                        rel_score = FEEDBACK_OPTIONS["relevance"].index(relevance)
-                        qual_score = FEEDBACK_OPTIONS["quality"].index(quality)
-                        nov_score = FEEDBACK_OPTIONS["novelty"].index(novelty)
-                        cursor.execute(
-                            """
-                            INSERT INTO feedback 
-                            (post_id, relevance, quality, novelty, notes)
-                            VALUES (?, ?, ?, ?, ?)
-                        """,
-                            (post_id, rel_score, qual_score, nov_score, notes),
+                    if rating == "👎 Bad":
+                        reason = st.selectbox(
+                            "What was wrong?",
+                            ["Ad/Sponsored", "Low Quality", "Off-Topic", "Misleading"],
+                            key=f"reason_{post_id}",
                         )
-                        conn.commit()
-                        st.success("Thanks for your feedback!")
+                        severity = st.slider(
+                            "How severe?", 1, 3, 1, 
+                            help="1=Minor, 2=Moderate, 3=Major",
+                            key=f"severity_{post_id}"
+                        )
+                    else:
+                        quality = st.radio(
+                            "Quality rating",
+                            FEEDBACK_OPTIONS["quality"],
+                            key=f"qual_{post_id}",
+                            horizontal=True
+                        )
+
+                    notes = st.text_area("Additional comments (optional)", key=f"notes_{post_id}")
+
+                    if st.form_submit_button("Submit Rating"):
+                        if rating == "👎 Bad":
+                            # Handle negative rating (flag content)
+                            print(f"Flagging content {post_id}")
+                            flag_content(post_id, source, reason, severity)
+                            st.success("Thanks for your feedback - content has been flagged")
+                        else:
+                            # Handle positive rating (record feedback)
+                            print(f"Recording positive feedback for {post_id}")
+                            qual_score = FEEDBACK_OPTIONS["quality"].index(quality)
+                            cursor.execute(
+                                """
+                                INSERT INTO feedback 
+                                (post_id, quality, notes, rating_type)
+                                VALUES (?, ?, ?, ?)
+                                """,
+                                (post_id, qual_score, notes, "positive"),
+                            )
+                            conn.commit()
+                            st.success("Thanks for your feedback!")
+
+                        time.sleep(1)
+                        st.rerun()
 
     conn.close()
 

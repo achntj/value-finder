@@ -50,9 +50,12 @@ def summarize_unsummarized():
         SELECT id, content FROM posts 
         WHERE summary IS NULL 
         AND content IS NOT NULL
-        AND LENGTH(content) > 100
+        AND id NOT IN (
+            SELECT post_id FROM flagged_content 
+            WHERE severity >= 2
+        )
         ORDER BY created_at DESC
-        LIMIT 20  -- Process in batches
+        LIMIT 20
     """
     )
     rows = cursor.fetchall()
