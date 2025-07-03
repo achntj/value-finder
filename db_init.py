@@ -33,7 +33,7 @@ def initialize_database():
     )
     """)
 
-    # Source discovery and tracking
+    # Source discovery and tracking (updated with quality management)
     cursor.execute("""
     CREATE TABLE IF NOT EXISTS discovered_sources (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -42,7 +42,10 @@ def initialize_database():
         discovery_method TEXT,      -- 'crawl', 'link_follow', 'recommendation'
         parent_url TEXT,           -- URL where this source was discovered
         quality_score REAL DEFAULT 1.0,
+        estimated_quality BOOLEAN DEFAULT 1,  -- 1=estimated, 0=actual
+        last_quality_update TIMESTAMP,
         last_crawled TIMESTAMP,
+        crawl_count INTEGER DEFAULT 0,
         is_active BOOLEAN DEFAULT 1,
         discovered_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
         CHECK (is_active IN (0, 1))
@@ -84,7 +87,7 @@ def initialize_database():
     )
     """)
 
-    # Interest profile weights (enhanced for learning)
+    # Interest profile weights (enhanced for learning) - UPDATED
     cursor.execute("""
     CREATE TABLE IF NOT EXISTS interest_profile (
         category TEXT PRIMARY KEY,
@@ -92,7 +95,8 @@ def initialize_database():
         learning_adjustment REAL DEFAULT 0.0,
         positive_feedback_count INTEGER DEFAULT 0,
         negative_feedback_count INTEGER DEFAULT 0,
-        last_updated TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        last_updated TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+        boost_factor REAL DEFAULT 1.0  -- NEW COLUMN ADDED
     )
     """)
 
@@ -126,12 +130,16 @@ def initialize_database():
 
     # Initialize interest profile weights from config
     from config import INTEREST_CONFIG
+    # Initialize interest profile weights with boost factors
     for category, config in INTEREST_CONFIG["categories"].items():
+        # Add boost factor to category config
+        config["boost"] = config.get("boost", 1.0)  # Default to 1.0 if not set
+        
         cursor.execute("""
         INSERT OR IGNORE INTO interest_profile 
-        (category, current_weight)
-        VALUES (?, ?)
-        """, (category, config["weight"]))
+        (category, current_weight, boost_factor)
+        VALUES (?, ?, ?)
+        """, (category, config["weight"], config["boost"]))
 
     # Initialize some high-quality seed sources
     seed_sources = [

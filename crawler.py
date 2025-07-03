@@ -21,13 +21,13 @@ logger = logging.getLogger(__name__)
 
 DATABASE = "database.db"
 HEADERS = {"User-Agent": "Mozilla/5.0 (compatible; WebScout/1.0)"}
-SOURCE_QUALITY_THRESHOLD = 0.6
+SOURCE_QUALITY_THRESHOLD = 0.65
 
 def get_db_connection():
     return sqlite3.connect(DATABASE)
 
 def discover_new_sources(url, content):
-    """Discover new potential sources from page content"""
+    """Discover new potential sources from page content with quality inheritance"""
     conn = get_db_connection()
     cursor = conn.cursor()
     
@@ -44,6 +44,11 @@ def discover_new_sources(url, content):
             # Normalize URL
             normalized_url = absolute_url.split('#')[0].split('?')[0]
             links.add(normalized_url)
+        
+        # Get parent source quality
+        cursor.execute("SELECT quality_score FROM discovered_sources WHERE url = ?", (url,))
+        parent_row = cursor.fetchone()
+        parent_quality = parent_row[0] if parent_row else 1.0
         
         for link in links:
             # Filter out non-content links
@@ -71,17 +76,36 @@ def discover_new_sources(url, content):
                 source_type = "hackernews"
             elif "twitter.com" in link:
                 source_type = "twitter"
+            elif "indiehackers.com" in link:
+                source_type = "indiehackers"
+            elif "lesswrong.com" in link:
+                source_type = "lesswrong"
                 
+            # Calculate new quality (inherit 90% of parent quality)
+            new_quality = parent_quality * 0.9
+            is_estimated = 1  # Mark as estimated quality
+            
             # Add new source
             cursor.execute("""
                 INSERT OR IGNORE INTO discovered_sources 
-                (url, source_type, discovery_method, parent_url, quality_score)
-                VALUES (?, ?, ?, ?, ?)
-            """, (link, source_type, "link_follow", url, 1.0))
+                (url, source_type, discovery_method, parent_url, 
+                 quality_score, estimated_quality, discovered_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?)
+            """, (
+                link, 
+                source_type, 
+                "link_follow", 
+                url, 
+                new_quality,
+                is_estimated,
+                datetime.datetime.utcnow().isoformat()
+            ))
         
         conn.commit()
+        logger.info(f"Discovered {len(links)} new potential sources from {url}")
     except Exception as e:
         logger.error(f"Discovery failed for {url}: {str(e)}")
+        conn.rollback()
     finally:
         conn.close()
 
@@ -471,27 +495,47 @@ def scrape_source(url, source_type):
             logger.error(f"Error scraping {url}: {str(e)}")
 
 def scrape_active_sources():
-    """Scrape all active sources in rotation"""
-    logger.info("Scraping active sources...")
+    """Scrape all active sources using quality-based prioritization"""
+    logger.info("Scraping active sources with quality prioritization...")
     conn = get_db_connection()
     cursor = conn.cursor()
     
     try:
-        # Get active sources ordered by quality and last crawled
+        # Get active sources ordered by quality and freshness
         cursor.execute("""
             SELECT url, source_type 
             FROM discovered_sources 
             WHERE is_active = 1
-            ORDER BY quality_score DESC, last_crawled ASC
-            LIMIT 5
-        """)
+            AND quality_score >= ?
+            ORDER BY 
+                (quality_score * 0.7 + 
+                 (1 - (julianday('now') - julianday(discovered_at)) / 30) * 0.3) DESC,
+                last_crawled ASC NULLS FIRST
+            LIMIT 4  -- Optimal for hourly processing
+        """, (SOURCE_QUALITY_THRESHOLD,))
         
         sources = cursor.fetchall()
+        logger.info(f"Selected {len(sources)} sources for scraping")
+    except Exception as e:
+        logger.error(f"Source selection failed: {str(e)}")
+        sources = []
     finally:
         conn.close()
     
+    if not sources:
+        logger.warning("No active sources found - falling back to seed sources")
+        # Scrape default sources
+        scrape_hacker_news()
+        scrape_reddit_subreddit("artificial")
+        scrape_arxiv()
+        scrape_indie_hackers()
+        return
+    
     for url, source_type in sources:
-        scrape_source(url, source_type)
+        try:
+            scrape_source(url, source_type)
+        except Exception as e:
+            logger.error(f"Scraping failed for {url}: {str(e)}")
         
         # Update last_crawled timestamp
         conn = get_db_connection()
@@ -499,15 +543,21 @@ def scrape_active_sources():
         try:
             cursor.execute("""
                 UPDATE discovered_sources 
-                SET last_crawled = ?
+                SET last_crawled = ?,
+                    crawl_count = COALESCE(crawl_count, 0) + 1
                 WHERE url = ?
             """, (datetime.datetime.utcnow().isoformat(), url))
             conn.commit()
+            logger.info(f"Updated crawl info for {url}")
+        except Exception as e:
+            logger.error(f"Failed to update crawl info: {str(e)}")
         finally:
             conn.close()
         
         # Be polite between sources
         time.sleep(random.uniform(1, 3))
+    
+    logger.info("Finished scraping active sources")
 
 if __name__ == "__main__":
     # Run scraping of active sources

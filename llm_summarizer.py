@@ -10,6 +10,7 @@ OLLAMA_URL = "http://localhost:11434/api/generate"
 OLLAMA_MODEL = "llama3"
 MAX_TOKENS = 3000
 SUMMARY_CACHE = {}  # In-memory cache to avoid reprocessing
+LIMIT = 25
 
 def get_content_hash(content):
     """Generate consistent hash for content"""
@@ -51,9 +52,8 @@ def summarize_high_value():
         AND is_high_value = 1
         AND content IS NOT NULL
         ORDER BY value_score DESC
-        LIMIT 10
-    """
-    )
+        LIMIT ?
+    """, (LIMIT,))
     rows = cursor.fetchall()
 
     print(f"📝 Summarizing {len(rows)} high-value posts...")

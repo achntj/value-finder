@@ -16,9 +16,8 @@ logger = logging.getLogger(__name__)
 
 SOURCE_REHABILITATION_INTERVAL = 7  # days
 REHABILITATION_RATE = 1.1  # 10% score increase per cycle
-SOURCE_PENALTY_THRESHOLD = 0.6  # Must match other files
-PIPELINE_INTERVAL_HOURS = 1  # New constant for pipeline interval
-
+SOURCE_PENALTY_THRESHOLD = 0.6
+PIPELINE_INTERVAL_HOURS = 1
 
 class TaskScheduler:
     def __init__(self):
@@ -31,6 +30,25 @@ class TaskScheduler:
         logger.info("\nReceived shutdown signal")
         self.running = False
         self.conn.close()
+
+    def rehabilitate_sources(self):
+        """Gradually improve penalized sources over time"""
+        cursor = self.conn.cursor()
+        try:
+            cursor.execute("""
+                UPDATE source_penalties
+                SET penalty_score = LEAST(penalty_score * ?, 1.0)
+                WHERE penalty_score < ?
+            """, (REHABILITATION_RATE, SOURCE_PENALTY_THRESHOLD))
+            updated = cursor.rowcount
+            self.conn.commit()
+            if updated > 0:
+                logger.info(f"Rehabilitated {updated} underperforming sources")
+            return True
+        except Exception as e:
+            logger.error(f"Source rehabilitation failed: {e}")
+            self.conn.rollback()
+            return False
 
     def clean_low_value_content(self):
         """Clean up low-value content without feedback"""
@@ -96,21 +114,26 @@ class TaskScheduler:
             return False
 
     def run_pipeline(self):
-        """Run the full processing pipeline"""
+        """Run the full processing pipeline with quality checks"""
         if not self.running:
             return False
 
-        # Run standard tasks
+        # Run standard tasks with staggered intervals
         tasks = [
-            (["python", "crawler.py"], "crawler", 60),
-            (["python", "scorer.py"], "scorer", 60),
-            (["python", "llm_summarizer.py"], "summarizer", 60),
+            (["python", "crawler.py"], "crawler", 55),  # 5 min before pipeline
+            (["python", "scorer.py"], "scorer", 58),     # 2 min after crawler
+            (["python", "llm_summarizer.py"], "summarizer", 59)  # 1 min after scorer
         ]
 
         ran_any = False
         for command, name, interval in tasks:
             if self.run_task(command, name, interval):
                 ran_any = True
+                # Add buffer between tasks
+                for _ in range(30):
+                    if not self.running:
+                        break
+                    time.sleep(1)
 
         return ran_any
 
@@ -122,16 +145,17 @@ class TaskScheduler:
                 # Run daily maintenance at 3 AM
                 if datetime.now().hour == 3:
                     self.clean_low_value_content()
+                    self.rehabilitate_sources()
                     self.run_task(
-                        ["python", "embedding.py"], "embedding", 1440  # 24 hours
+                        ["python", "embedding.py"], "embedding", 1440
                     )
 
-                # Run main pipeline every {interval} hours
+                # Run main pipeline every hour
                 if self.should_run_task("full_pipeline", PIPELINE_INTERVAL_HOURS * 60):
                     if self.run_pipeline():
                         self.update_last_run("full_pipeline")
 
-                # Check every minute if we should run anything
+                # Check every minute
                 for _ in range(60):
                     if not self.running:
                         break
@@ -140,7 +164,6 @@ class TaskScheduler:
             except Exception as e:
                 logger.error(f"Scheduler error: {e}")
                 time.sleep(60)
-
 
 if __name__ == "__main__":
     scheduler = TaskScheduler()
