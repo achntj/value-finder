@@ -17,7 +17,8 @@ logger = logging.getLogger(__name__)
 SOURCE_REHABILITATION_INTERVAL = 7  # days
 REHABILITATION_RATE = 1.1  # 10% score increase per cycle
 SOURCE_PENALTY_THRESHOLD = 0.6  # Must match other files
-PIPELINE_INTERVAL_HOURS = 10  # New constant for pipeline interval
+PIPELINE_INTERVAL_HOURS = 1  # New constant for pipeline interval
+
 
 class TaskScheduler:
     def __init__(self):
@@ -119,7 +120,7 @@ class TaskScheduler:
 
         # Clean up non-favorite posts first
         # if not self.clean_non_favorites():
-            # return False
+        # return False
 
         # Run standard tasks
         tasks = [
@@ -136,7 +137,7 @@ class TaskScheduler:
         return ran_any
 
     def run(self):
-        logger.info("Starting WebScout scheduler")
+        logger.info("Starting scheduler")
 
         while self.running:
             try:
@@ -147,7 +148,7 @@ class TaskScheduler:
                         ["python", "embedding.py"], "embedding", 1440  # 24 hours
                     )
 
-                # Run main pipeline every 10 hours
+                # Run main pipeline every {interval} hours
                 if self.should_run_task("full_pipeline", PIPELINE_INTERVAL_HOURS * 60):
                     if self.run_pipeline():
                         self.update_last_run("full_pipeline")
