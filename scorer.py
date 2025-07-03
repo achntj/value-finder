@@ -265,7 +265,7 @@ class ValueScorer:
             # Update penalty score with bounds checking
             cursor.execute("""
                 UPDATE source_penalties
-                SET penalty_score = LEAST(GREATEST(penalty_score + ?, 0.1), 1.0)
+                SET penalty_score = MIN(MAX(penalty_score + ?, 0.1), 1.0)
                 WHERE source = ?
             """, (net_effect, source))
             
@@ -296,6 +296,7 @@ class ValueScorer:
                 SELECT 
                     source,
                     COUNT(*) AS total_posts,
+                    AVG(value_score) AS avg_score,
                     SUM(CASE WHEN is_high_value = 1 THEN 1 ELSE 0 END) AS high_value_posts
                 FROM posts
                 GROUP BY source
@@ -304,10 +305,10 @@ class ValueScorer:
             
             source_stats = cursor.fetchall()
             
-            for source, total_posts, high_value_posts in source_stats:
+            for source, total_posts, avg_score, high_value_posts in source_stats:
                 # Calculate value ratio and quality score
                 value_ratio = high_value_posts / total_posts if total_posts > 0 else 0.0
-                quality_score = min(1.0, max(0.1, value_ratio * 1.2))
+                quality_score = min(1.0, max(0.1, (value_ratio + avg_score) / 2))
                 
                 # Update source_penalties table
                 cursor.execute("""

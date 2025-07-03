@@ -37,7 +37,7 @@ class TaskScheduler:
         try:
             cursor.execute("""
                 UPDATE source_penalties
-                SET penalty_score = LEAST(penalty_score * ?, 1.0)
+                SET penalty_score = MIN(penalty_score * ?, 1.0)
                 WHERE penalty_score < ?
             """, (REHABILITATION_RATE, SOURCE_PENALTY_THRESHOLD))
             updated = cursor.rowcount
