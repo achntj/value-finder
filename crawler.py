@@ -36,7 +36,7 @@ def discover_new_sources(url, content):
         links = set()
         for a in soup.find_all("a", href=True):
             href = a["href"]
-            # Resolve relative URLs
+            # Resolve relative URLs AND absolute automicatically
             absolute_url = urljoin(url, href)
             # Filter out non-http links
             if not absolute_url.startswith("http"):
@@ -76,10 +76,6 @@ def discover_new_sources(url, content):
                 source_type = "hackernews"
             elif "twitter.com" in link:
                 source_type = "twitter"
-            elif "indiehackers.com" in link:
-                source_type = "indiehackers"
-            elif "lesswrong.com" in link:
-                source_type = "lesswrong"
                 
             # Calculate new quality (inherit 90% of parent quality)
             new_quality = parent_quality * 0.9
@@ -382,49 +378,6 @@ def scrape_arxiv():
     finally:
         conn.close()
 
-def scrape_indie_hackers():
-    logger.info("Scraping Indie Hackers...")
-    url = "https://www.indiehackers.com/"
-    conn = get_db_connection()
-    try:
-        res = requests.get(url, headers=HEADERS)
-        if res.status_code != 200:
-            logger.error(f"Error fetching Indie Hackers: {res.status_code}")
-            return
-            
-        # Discover sources from page content
-        discover_new_sources(url, res.text)
-            
-        soup = BeautifulSoup(res.text, "html.parser")
-        posts = soup.find_all("div", class_="feed-item")
-
-        for post in posts[:10]:  # Limit to 10 posts
-            title_tag = post.find("a", class_="feed-item__title")
-            if not title_tag:
-                continue
-
-            title = title_tag.text.strip()
-            post_url = "https://www.indiehackers.com" + title_tag["href"]
-            post_id = hashlib.md5(post_url.encode()).hexdigest()
-
-            content_tag = post.find("div", class_="feed-item__content")
-            content = content_tag.text.strip() if content_tag else ""
-
-            post_data = {
-                "id": post_id,
-                "title": title,
-                "url": post_url,
-                "content": f"{title}\n\n{content}",
-                "source": "indiehackers",
-                "created_at": datetime.datetime.utcnow(),
-            }
-
-            if not post_exists(conn, post_id):
-                save_post(conn, post_data)
-                logger.info(f"Saved Indie Hackers post: {title[:60]}...")
-    finally:
-        conn.close()
-
 def scrape_source(url, source_type):
     """Scrape content from a specific source"""
     logger.info(f"Scraping source: {url}")
@@ -436,8 +389,6 @@ def scrape_source(url, source_type):
         scrape_reddit_subreddit(subreddit=subreddit)
     elif "arxiv" in url:
         scrape_arxiv()
-    elif "indiehackers" in url:
-        scrape_indie_hackers()
     else:
         # Generic webpage scraping
         try:
@@ -528,7 +479,6 @@ def scrape_active_sources():
         scrape_hacker_news()
         scrape_reddit_subreddit("artificial")
         scrape_arxiv()
-        scrape_indie_hackers()
         return
     
     for url, source_type in sources:

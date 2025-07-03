@@ -15,9 +15,9 @@ INTEREST_CONFIG = {
             "boost": 1.0
         },
         "startups": {
-            "name": "Startup + Indie Hacking",
+            "name": "Startup",
             "keywords": ["bootstrapped", "MRR", "SaaS", "founder"],
-            "sources": ["indiehackers", "hackernews", "reddit/startups"],
+            "sources": ["hackernews", "reddit/startups"],
             "weight": 1.0,
             "boost": 1.0
         },
@@ -54,7 +54,6 @@ INTEREST_CONFIG = {
         "hackernews": 1.2,
         "arxiv": 1.3,
         "lesswrong": 1.2,
-        "indiehackers": 1.1,
         "reddit": 1.0,
         "blog": 1.0,
         "twitter": 0.8,
