@@ -11,11 +11,9 @@ OLLAMA_MODEL = "llama3"
 MAX_TOKENS = 3000
 SUMMARY_CACHE = {}  # In-memory cache to avoid reprocessing
 
-
 def get_content_hash(content):
     """Generate consistent hash for content"""
     return hashlib.md5(content.encode()).hexdigest()
-
 
 def summarize(text):
     """Summarize text with caching"""
@@ -26,7 +24,7 @@ def summarize(text):
         return SUMMARY_CACHE[content_hash]
 
     trimmed = text[:MAX_TOKENS]
-    prompt = f"Summarize this in 3–5 clear bullet points:\n\n{trimmed}"
+    prompt = f"Summarize this in 3–5 clear bullet points, focusing on novel insights and practical value:\n\n{trimmed}"
 
     try:
         res = requests.post(
@@ -40,27 +38,25 @@ def summarize(text):
         print(f"❌ Error summarizing: {e}")
         return None
 
-
-def summarize_unsummarized():
+def summarize_high_value():
+    """Summarize high-value content only"""
     conn = sqlite3.connect(DATABASE)
     cursor = conn.cursor()
 
     cursor.execute(
         """
-        SELECT id, content FROM posts 
+        SELECT id, content 
+        FROM posts 
         WHERE summary IS NULL 
+        AND is_high_value = 1
         AND content IS NOT NULL
-        AND id NOT IN (
-            SELECT post_id FROM flagged_content 
-            WHERE severity >= 2
-        )
-        ORDER BY created_at DESC
-        LIMIT 20
+        ORDER BY value_score DESC
+        LIMIT 10
     """
     )
     rows = cursor.fetchall()
 
-    print(f"📝 Summarizing {len(rows)} unsummarized posts...")
+    print(f"📝 Summarizing {len(rows)} high-value posts...")
 
     for idx, (post_id, content) in enumerate(rows):
         print(f"[{idx+1}/{len(rows)}] Summarizing post: {post_id}")
@@ -78,8 +74,7 @@ def summarize_unsummarized():
         time.sleep(0.3)  # Small pause to avoid hammering Ollama
 
     conn.close()
-    print("✅ Summarization complete.")
-
+    print("✅ High-value summarization complete.")
 
 if __name__ == "__main__":
-    summarize_unsummarized()
+    summarize_high_value()

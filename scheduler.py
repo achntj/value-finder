@@ -32,43 +32,25 @@ class TaskScheduler:
         self.running = False
         self.conn.close()
 
-    def clean_non_favorites(self):
-        """Clean up non-favorite posts"""
+    def clean_low_value_content(self):
+        """Clean up low-value content without feedback"""
         cursor = self.conn.cursor()
         try:
-            cursor.execute("DELETE FROM posts WHERE is_favorite = 0")
+            cursor.execute("""
+                DELETE FROM posts 
+                WHERE is_high_value = 0 
+                AND user_feedback IS NULL 
+                AND value_score < 0.3
+            """)
             deleted = cursor.rowcount
             self.conn.commit()
             if deleted > 0:
-                logger.info(f"Cleaned up {deleted} non-favorite posts")
+                logger.info(f"Cleaned up {deleted} low-value posts")
             return True
         except Exception as e:
             logger.error(f"Cleanup failed: {e}")
             self.conn.rollback()
             return False
-
-    def rehabilitate_sources(self):
-        """Gradually improve penalized sources"""
-        cursor = self.conn.cursor()
-        try:
-            cursor.execute(
-                f"""
-                UPDATE source_penalties
-                SET penalty_score = LEAST(1.0, penalty_score * ?)
-                WHERE last_flagged < datetime('now', '-{SOURCE_REHABILITATION_INTERVAL} days')
-                  AND penalty_score < ?
-            """,
-                (REHABILITATION_RATE, SOURCE_PENALTY_THRESHOLD),
-            )
-
-            affected = cursor.rowcount
-            if affected > 0:
-                logger.info(f"Rehabilitated {affected} sources")
-
-            self.conn.commit()
-
-        except:
-            pass
 
     def should_run_task(self, task_name, interval_minutes):
         cursor = self.conn.cursor()
@@ -118,10 +100,6 @@ class TaskScheduler:
         if not self.running:
             return False
 
-        # Clean up non-favorite posts first
-        # if not self.clean_non_favorites():
-        # return False
-
         # Run standard tasks
         tasks = [
             (["python", "crawler.py"], "crawler", 60),
@@ -143,7 +121,7 @@ class TaskScheduler:
             try:
                 # Run daily maintenance at 3 AM
                 if datetime.now().hour == 3:
-                    self.rehabilitate_sources()
+                    self.clean_low_value_content()
                     self.run_task(
                         ["python", "embedding.py"], "embedding", 1440  # 24 hours
                     )

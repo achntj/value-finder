@@ -4,342 +4,332 @@ import numpy as np
 from sentence_transformers import SentenceTransformer, util
 from datetime import datetime
 import json
+import re
 from config import INTEREST_CONFIG
+import logging
+
+# Configure logging
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
 
 DATABASE = "database.db"
-DIVERSITY_WINDOW = 3
-DIVERSITY_PENALTY = 0.15
+VALUE_THRESHOLD = 0.6  # Threshold for marking content as high-value
 LEARNING_RATE = 0.1
-FLAGGED_PENALTY = 0.5  # Score multiplier for flagged content
-SOURCE_PENALTY_THRESHOLD = 0.6  # Minimum source reliability score
+NOVELTY_KEYWORDS = ["new", "breakthrough", "first", "novel", "innovative", "revolutionary", "emerging"]
+QUALITY_INDICATORS = ["research", "study", "analysis", "framework", "methodology", "evidence", "data"]
+JUNK_INDICATORS = ["click", "viral", "trending", "hot", "must-see", "shocking", "you won't believe"]
 
-
-class ContentScorer:
+class ValueScorer:
     def __init__(self):
         self.model = SentenceTransformer("all-MiniLM-L6-v2")
         self.conn = sqlite3.connect(DATABASE)
         self.categories = INTEREST_CONFIG["categories"]
         self.source_weights = INTEREST_CONFIG["source_weights"]
         self.category_keys = list(self.categories.keys())
+        self.learning_adjustments = self.load_learning_adjustments()
 
-    def apply_source_penalties(self):
-        """Apply source reliability penalties to posts"""
+    def load_learning_adjustments(self):
+        """Load learning adjustments from user feedback"""
         cursor = self.conn.cursor()
+        cursor.execute("""
+            SELECT category, learning_adjustment, positive_feedback_count, negative_feedback_count
+            FROM interest_profile
+        """)
+        
+        adjustments = {}
+        for row in cursor.fetchall():
+            category, adj, pos_count, neg_count = row
+            adjustments[category] = {
+                'adjustment': float(adj or 0),
+                'positive_count': int(pos_count or 0),
+                'negative_count': int(neg_count or 0)
+            }
+        
+        return adjustments
 
-        # Apply source penalties
-        cursor.execute(
-            """
-            UPDATE posts
-            SET score = score * (
-                SELECT COALESCE(penalty_score, 1.0)
-                FROM source_penalties
-                WHERE source = posts.source
-            )
-            WHERE EXISTS (
-                SELECT 1 FROM source_penalties
-                WHERE source = posts.source
-            )
-        """
-        )
+    def extract_content_features(self, content, title, source):
+        """Extract features that indicate content value"""
+        if not content:
+            return {}
+        
+        text = (title + " " + content).lower()
+        words = text.split()
+        
+        features = {
+            'word_count': len(words),
+            'title_length': len(title.split()) if title else 0,
+            'has_numbers': bool(re.search(r'\d+', text)),
+            'has_technical_terms': sum(1 for term in QUALITY_INDICATORS if term in text),
+            'novelty_indicators': sum(1 for term in NOVELTY_KEYWORDS if term in text),
+            'junk_indicators': sum(1 for term in JUNK_INDICATORS if term in text),
+            'has_links': bool(re.search(r'http[s]?://', content or '')),
+            'source_authority': self.source_weights.get(source, 1.0),
+            'readability_score': self.calculate_readability(text),
+            'content_depth': min(len(words) / 100, 5.0),  # Normalized depth score
+        }
+        
+        return features
 
-        # Apply additional penalty for flagged content
-        cursor.execute(
-            """
-            UPDATE posts
-            SET score = score * ?
-            WHERE id IN (
-                SELECT post_id FROM flagged_content
-                WHERE severity >= 2
-            )
-        """,
-            (FLAGGED_PENALTY,),
-        )
+    def calculate_readability(self, text):
+        """Simple readability score based on sentence and word length"""
+        if not text:
+            return 0.0
+        
+        sentences = re.split(r'[.!?]+', text)
+        words = text.split()
+        
+        if len(sentences) == 0 or len(words) == 0:
+            return 0.0
+        
+        avg_sentence_length = len(words) / len(sentences)
+        avg_word_length = sum(len(word) for word in words) / len(words)
+        
+        # Normalize to 0-1 scale, favoring moderate complexity
+        readability = 1.0 - abs(avg_sentence_length - 15) / 30
+        readability += 1.0 - abs(avg_word_length - 5) / 10
+        
+        return max(0.0, min(1.0, readability / 2))
 
-        # Completely hide content from banned sources
-        cursor.execute(
-            """
-            DELETE FROM posts
-            WHERE source IN (
-                SELECT source FROM source_penalties
-                WHERE penalty_score < ?
-            )
-        """,
-            (SOURCE_PENALTY_THRESHOLD,),
-        )
+    def calculate_value_score(self, features, interest_score):
+        """Calculate overall value score based on features"""
+        
+        # Base score from interest matching
+        value_score = interest_score
+        
+        # Quality indicators boost
+        quality_boost = min(features['has_technical_terms'] * 0.1, 0.3)
+        value_score += quality_boost
+        
+        # Novelty indicators boost
+        novelty_boost = min(features['novelty_indicators'] * 0.05, 0.2)
+        value_score += novelty_boost
+        
+        # Junk indicators penalty
+        junk_penalty = features['junk_indicators'] * 0.1
+        value_score -= junk_penalty
+        
+        # Content depth reward
+        depth_reward = min(features['content_depth'] * 0.1, 0.2)
+        value_score += depth_reward
+        
+        # Readability reward
+        readability_reward = features['readability_score'] * 0.1
+        value_score += readability_reward
+        
+        # Source authority multiplier
+        value_score *= features['source_authority']
+        
+        # Apply learning adjustments
+        learning_adj = self.learning_adjustments.get(features.get('topic', ''), {}).get('adjustment', 0)
+        value_score += learning_adj
+        
+        return max(0.0, min(1.0, value_score))
 
-        self.conn.commit()
+    def calculate_novelty_score(self, features, content):
+        """Calculate novelty score"""
+        novelty_score = 0.0
+        
+        # Recent date mentions
+        if re.search(r'202[3-9]|2024|2025', content or ''):
+            novelty_score += 0.2
+        
+        # Novelty keywords
+        novelty_score += min(features['novelty_indicators'] * 0.15, 0.5)
+        
+        # Technical terms suggest new developments
+        novelty_score += min(features['has_technical_terms'] * 0.05, 0.3)
+        
+        return max(0.0, min(1.0, novelty_score))
 
     def load_interest_embeddings(self):
+        """Load interest embeddings with learning adjustments"""
         interest_texts = []
         self.weights = []
 
         for cat, config in self.categories.items():
             cursor = self.conn.cursor()
             cursor.execute(
-                """
-                SELECT current_weight FROM interest_profile 
-                WHERE category = ?
-            """,
-                (cat,),
+                "SELECT current_weight FROM interest_profile WHERE category = ?",
+                (cat,)
             )
             row = cursor.fetchone()
-            weight = float(row[0]) if row else float(config["weight"])
-
+            base_weight = float(row[0]) if row else float(config["weight"])
+            
+            # Apply learning adjustments
+            learning_data = self.learning_adjustments.get(cat, {})
+            adjusted_weight = base_weight + learning_data.get('adjustment', 0)
+            
             interest_texts.append(config["name"] + ": " + ", ".join(config["keywords"]))
-            self.weights.append(weight)
+            self.weights.append(adjusted_weight)
 
         embeddings = self.model.encode(interest_texts, normalize_embeddings=True)
         return embeddings
 
-    def get_post_embeddings(self):
+    def get_unscored_posts(self):
+        """Get posts that need scoring"""
         cursor = self.conn.cursor()
-        cursor.execute(
-            """
-            SELECT id, content, source FROM posts 
-            WHERE embedding IS NULL AND content IS NOT NULL
-            AND id NOT IN (
-                SELECT post_id FROM flagged_content 
-                WHERE severity >= 3
-            )
-        """
-        )
-        rows = cursor.fetchall()
+        cursor.execute("""
+            SELECT id, title, content, source 
+            FROM posts 
+            WHERE value_score IS NULL AND content IS NOT NULL
+            ORDER BY created_at DESC
+            LIMIT 100
+        """)
+        return cursor.fetchall()
 
-        if not rows:
-            return [], [], [], []
-
-        ids = [r[0] for r in rows]
-        texts = [r[1] for r in rows]
-        sources = [r[2] for r in rows]
-        embeddings = self.model.encode(texts, normalize_embeddings=True)
-
-        for post_id, embedding in zip(ids, embeddings):
-            cursor.execute(
-                """
-                UPDATE posts SET embedding = ? 
-                WHERE id = ?
-            """,
-                (embedding.tobytes(), post_id),
-            )
-        self.conn.commit()
-
-        return ids, texts, embeddings, sources
-
-    def compute_scores(self, post_embeddings, interest_embeddings, sources):
-        scores = []
-        topics = []
-
-        for i, post_vec in enumerate(post_embeddings):
-            sims = util.cos_sim(post_vec, interest_embeddings).numpy().flatten()
-            weighted_sims = sims * self.weights
-
-            best_topic_idx = np.argmax(weighted_sims)
-            best_score = weighted_sims[best_topic_idx]
-
-            source = sources[i]
-            source_weight = self.source_weights.get(source, 1.0)
-
-            # Apply source penalties
-            cursor = self.conn.cursor()
-            cursor.execute(
-                "SELECT penalty_score FROM source_penalties WHERE source = ?", (source,)
-            )
-            penalty_row = cursor.fetchone()
-            if penalty_row:
-                source_weight *= float(penalty_row[0])
-
-            best_score *= source_weight
-
-            scores.append(float(best_score))
-            topics.append(int(best_topic_idx))
-
-        return scores, topics
-
-    def apply_feedback_adjustments(self):
+    def apply_learning_from_feedback(self):
+        """Apply learning from user feedback"""
         cursor = self.conn.cursor()
-
-        # Process negative feedback (for penalties)
-        cursor.execute(
-            """
-            SELECT p.topic, f.quality, f.notes
-            FROM feedback f
-            JOIN posts p ON f.post_id = p.id
-            WHERE f.timestamp > datetime('now', '-7 days')
-            AND f.rating_type = 'negative'
-            AND f.quality IS NOT NULL
-            """
-        )
-        negative_feedback = cursor.fetchall()
-
-        if negative_feedback:
-            adjustments = {cat: [] for cat in self.categories}
-
-            for topic, quality, notes in negative_feedback:
-                try:
-                    if isinstance(topic, str):
-                        topic_idx = self.category_keys.index(topic)
-                    else:
-                        topic_idx = int(topic)
-
-                    cat = self.category_keys[topic_idx]
-                    # Convert quality (0-2 scale) to 0-1 range
-                    normalized_quality = float(quality) / 2.0
-                    adjustments[cat].append(normalized_quality)
-                except (ValueError, IndexError) as e:
-                    logger.warning(f"Invalid topic '{topic}' in feedback: {e}")
-                    continue
-
-            for cat, qualities in adjustments.items():
-                if qualities:
-                    avg_quality = np.mean(qualities)
-                    current_weight = float(self.categories[cat]["weight"])
-                    # Decrease weight for negative feedback (0.8-1.0 factor)
-                    new_weight = current_weight * (0.8 + (0.2 * (1 - avg_quality)))
-
-                    cursor.execute(
-                        """
-                        INSERT OR REPLACE INTO interest_profile 
-                        (category, current_weight, last_updated)
-                        VALUES (?, ?, ?)
-                        """,
-                        (cat, new_weight, datetime.now().isoformat()),
-                    )
-
-        # Process positive feedback (for rewards)
-        cursor.execute(
-            """
-            SELECT p.topic, f.quality
-            FROM feedback f
-            JOIN posts p ON f.post_id = p.id
-            WHERE f.timestamp > datetime('now', '-7 days')
-            AND f.rating_type = 'positive'
-            AND f.quality IS NOT NULL
-            """
-        )
-        positive_feedback = cursor.fetchall()
-
-        if positive_feedback:
-            positive_adjustments = {cat: [] for cat in self.categories}
-
-            for topic, quality in positive_feedback:
-                try:
-                    if isinstance(topic, str):
-                        topic_idx = self.category_keys.index(topic)
-                    else:
-                        topic_idx = int(topic)
-
-                    cat = self.category_keys[topic_idx]
-                    # Convert quality (0-2 scale) to 0-1 range
-                    normalized_quality = float(quality) / 2.0
-                    positive_adjustments[cat].append(normalized_quality)
-                except (ValueError, IndexError) as e:
-                    logger.warning(f"Invalid topic '{topic}' in feedback: {e}")
-                    continue
-
-            for cat, qualities in positive_adjustments.items():
-                if qualities:
-                    avg_quality = np.mean(qualities)
-                    current_weight = float(self.categories[cat]["weight"])
-                    # Increase weight for positive feedback (1.0-1.2 factor)
-                    new_weight = current_weight * (1.0 + (0.2 * avg_quality))
-
-                    cursor.execute(
-                        """
-                        INSERT OR REPLACE INTO interest_profile 
-                        (category, current_weight, last_updated)
-                        VALUES (?, ?, ?)
-                        """,
-                        (cat, new_weight, datetime.now().isoformat()),
-                    )
-
-        # Rest of the method (flagged content processing) remains the same...
-        # Process flagged content patterns
-        cursor.execute(
-            """
-            SELECT p.topic, fc.reason, COUNT(*) as flag_count
-            FROM flagged_content fc
-            JOIN posts p ON fc.post_id = p.id
-            WHERE fc.timestamp > datetime('now', '-7 days')
-            GROUP BY p.topic, fc.reason
-            HAVING flag_count > 2
-            """
-        )
-        flag_patterns = cursor.fetchall()
-
-        for topic, reason, count in flag_patterns:
+        
+        # Process feedback patterns
+        cursor.execute("""
+            SELECT lf.feedback_type, lf.content_features, lf.source_features, p.topic
+            FROM learning_feedback lf
+            JOIN posts p ON lf.post_id = p.id
+            WHERE lf.timestamp > datetime('now', '-7 days')
+        """)
+        
+        feedback_data = cursor.fetchall()
+        adjustments = {cat: {'positive': 0, 'negative': 0} for cat in self.categories}
+        
+        for feedback_type, content_features, source_features, topic in feedback_data:
             try:
-                if isinstance(topic, str):
-                    topic_idx = self.category_keys.index(topic)
-                else:
-                    topic_idx = int(topic)
-
-                cat = self.category_keys[topic_idx]
-                # Significant weight reduction for problematic topics
-                cursor.execute(
-                    """
-                    UPDATE interest_profile
-                    SET current_weight = current_weight * 0.7
+                if topic in adjustments:
+                    if feedback_type in ['positive', 'false_negative']:
+                        adjustments[topic]['positive'] += 1
+                    elif feedback_type in ['negative', 'false_positive']:
+                        adjustments[topic]['negative'] += 1
+            except Exception as e:
+                logger.warning(f"Error processing feedback: {e}")
+                continue
+        
+        # Update interest profile with learning adjustments
+        for category, counts in adjustments.items():
+            if counts['positive'] > 0 or counts['negative'] > 0:
+                net_adjustment = (counts['positive'] - counts['negative']) * LEARNING_RATE
+                
+                cursor.execute("""
+                    UPDATE interest_profile 
+                    SET learning_adjustment = learning_adjustment + ?,
+                        positive_feedback_count = positive_feedback_count + ?,
+                        negative_feedback_count = negative_feedback_count + ?,
+                        last_updated = ?
                     WHERE category = ?
-                    """,
-                    (cat,),
-                )
-            except (ValueError, IndexError) as e:
-                logger.warning(f"Invalid topic '{topic}' in flag patterns: {e}")
-
+                """, (net_adjustment, counts['positive'], counts['negative'], 
+                      datetime.now().isoformat(), category))
+        
         self.conn.commit()
 
-    def update_scores_in_db(self, ids, scores, topics):
+    def update_source_quality(self):
+        """Update source quality based on value ratios"""
         cursor = self.conn.cursor()
-
-        for post_id, score, topic_idx in zip(ids, scores, topics):
-            try:
-                topic_name = self.category_keys[int(topic_idx)]
-                cursor.execute(
-                    """
-                    UPDATE posts 
-                    SET score = ?, topic = ?, last_updated = ?
-                    WHERE id = ?
-                """,
-                    (float(score), topic_name, datetime.now().isoformat(), post_id),
-                )
-            except (ValueError, IndexError) as e:
-                print(
-                    f"Warning: Invalid topic index {topic_idx} for post {post_id}: {e}"
-                )
-
+        
+        # Calculate value ratios for each source
+        cursor.execute("""
+            SELECT 
+                source,
+                COUNT(*) AS total_posts,
+                SUM(CASE WHEN is_high_value = 1 THEN 1 ELSE 0 END) AS high_value_posts
+            FROM posts
+            GROUP BY source
+        """)
+        
+        source_stats = cursor.fetchall()
+        
+        for source, total_posts, high_value_posts in source_stats:
+            value_ratio = high_value_posts / total_posts if total_posts > 0 else 0.0
+            
+            # Calculate quality score
+            quality_score = min(1.0, max(0.1, value_ratio * 1.2))
+            
+            cursor.execute("""
+                INSERT OR REPLACE INTO source_penalties 
+                (source, penalty_score, value_ratio, total_posts, high_value_posts)
+                VALUES (?, ?, ?, ?, ?)
+            """, (source, quality_score, value_ratio, total_posts, high_value_posts))
+        
         self.conn.commit()
+
+    def score_posts(self):
+        """Score all unscored posts"""
+        posts = self.get_unscored_posts()
+        if not posts:
+            logger.info("No unscored posts found")
+            return
+        
+        interest_embeddings = self.load_interest_embeddings()
+        
+        for post in posts:
+            post_id, title, content, source = post
+            features = self.extract_content_features(content, title, source)
+            
+            # Calculate interest score and determine topic
+            content_embedding = self.model.encode(content or title, normalize_embeddings=True)
+            similarities = util.cos_sim(content_embedding, interest_embeddings)[0].numpy()
+            weighted_similarities = similarities * self.weights
+            best_index = np.argmax(weighted_similarities)
+            interest_score = weighted_similarities[best_index]
+            topic = self.category_keys[best_index]
+            
+            # Calculate value and novelty scores
+            value_score = self.calculate_value_score(features, interest_score)
+            novelty_score = self.calculate_novelty_score(features, content)
+            
+            # Mark as high value if above threshold
+            is_high_value = 1 if value_score >= VALUE_THRESHOLD else 0
+            
+            # Update post with scores AND TOPIC
+            cursor = self.conn.cursor()
+            cursor.execute("""
+                UPDATE posts
+                SET value_score = ?,
+                    novelty_score = ?,
+                    interest_score = ?,
+                    is_high_value = ?,
+                    topic = ? 
+                WHERE id = ?
+            """, (value_score, novelty_score, interest_score, is_high_value, topic, post_id))
+            
+            # Store content features
+            cursor.execute("""
+                INSERT OR REPLACE INTO content_features 
+                (post_id, word_count, readability_score, technical_terms_count, 
+                 source_authority, content_depth, uniqueness_score)
+                VALUES (?, ?, ?, ?, ?, ?, ?)
+            """, (
+                post_id,
+                features.get('word_count', 0),
+                features.get('readability_score', 0),
+                features.get('has_technical_terms', 0),
+                features.get('source_authority', 1.0),
+                features.get('content_depth', 0),
+                0.0  # Placeholder for uniqueness_score
+            ))
+        
+        self.conn.commit()
+        logger.info(f"Scored {len(posts)} posts")
 
     def run(self):
-        print("Starting scoring process...")
-
+        logger.info("Starting scoring process")
+        
         try:
-            # Apply penalties first
-            self.apply_source_penalties()
-
-            # Process feedback and flags
-            self.apply_feedback_adjustments()
-
-            # Score new content
-            interest_embeddings = self.load_interest_embeddings()
-            ids, _, post_embeddings, sources = self.get_post_embeddings()
-
-            if ids:
-                scores, topics = self.compute_scores(
-                    post_embeddings, interest_embeddings, sources
-                )
-                self.update_scores_in_db(ids, scores, topics)
-                print(f"✅ Scored {len(ids)} posts.")
-            else:
-                print("No new posts to score.")
-
+            # Apply learning from recent feedback
+            self.apply_learning_from_feedback()
+            
+            # Score new posts
+            self.score_posts()
+            
+            # Update source quality metrics
+            self.update_source_quality()
+            
+            logger.info("Scoring completed successfully")
         except Exception as e:
-            print(f"❌ Error in scoring process: {e}")
+            logger.error(f"Scoring failed: {str(e)}")
+            self.conn.rollback()
             raise
-
-    def __del__(self):
-        self.conn.close()
-
+        finally:
+            self.conn.close()
 
 if __name__ == "__main__":
-    scorer = ContentScorer()
+    scorer = ValueScorer()
     scorer.run()

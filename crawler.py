@@ -9,6 +9,9 @@ from bs4 import BeautifulSoup
 import random
 from config import INTEREST_CONFIG
 import logging
+import re
+import hashlib  # For generating consistent IDs
+from urllib.parse import urljoin  # For resolving relative URLs
 
 # Configure logging
 logging.basicConfig(
@@ -18,75 +21,55 @@ logger = logging.getLogger(__name__)
 
 DATABASE = "database.db"
 HEADERS = {"User-Agent": "Mozilla/5.0 (compatible; WebScout/1.0)"}
+SOURCE_QUALITY_THRESHOLD = 0.6
 
-TARGETED_SOURCES = {
-    "ai_tech": [
-        "https://arxiv.org/list/cs.AI/recent",
-        "https://news.ycombinator.com/",
-    ],
-    "productivity": [
-        "https://news.ycombinator.com/",
-        "https://www.reddit.com/r/Zettelkasten/",
-    ],
-    "startups": [
-        "https://news.ycombinator.com/",
-    ],
-    "philosophy": [
-        "https://www.reddit.com/r/philosophy/",
-        "https://news.ycombinator.com/",
-        "https://www.reddit.com/r/Stoicism/",
-    ],
-    "writing": [
-        "https://www.reddit.com/r/writing/",
-        "https://news.ycombinator.com/",
-    ],
-    "markets": [
-        "https://www.reddit.com/r/investing/",
-        "https://www.reddit.com/r/economy/",
-        "https://news.ycombinator.com/",
-    ],
-    "serendipity": [
-        "https://news.ycombinator.com/newest",
-        "https://www.reddit.com/r/Serendipity/",
-    ],
-}
+def get_db_connection():
+    return sqlite3.connect(DATABASE)
 
-SOURCE_PENALTY_THRESHOLD = 0.6  # Minimum source reliability score
-FLAGGED_SEVERITY_THRESHOLD = 3  # Minimum severity to block content
-
-
-def should_block_content(url, source):
-    conn = sqlite3.connect(DATABASE)
+def discover_new_sources(url, content):
+    """Discover new potential sources from page content"""
+    conn = get_db_connection()
     cursor = conn.cursor()
-
-    # Check source penalties
-    cursor.execute(
-        """
-        SELECT 1 FROM source_penalties 
-        WHERE source = ? AND penalty_score < ?
-    """,
-        (source, SOURCE_PENALTY_THRESHOLD),
-    )
-    if cursor.fetchone():
-        conn.close()
-        return True
-
-    # Check URL patterns from flagged content
-    cursor.execute(
-        """
-        SELECT 1 FROM flagged_content fc
-        JOIN posts p ON fc.post_id = p.id
-        WHERE p.url = ? AND fc.severity >= ?
-    """,
-        (url, FLAGGED_SEVERITY_THRESHOLD),
-    )
-    if cursor.fetchone():
-        conn.close()
-        return True
-
+    
+    # Find all links in content
+    links = re.findall(r'href="(https?://[^"]+)"', content)
+    
+    for link in links:
+        # Filter out non-content links
+        if any(ext in link for ext in ['.png', '.jpg', '.jpeg', '.gif', '.pdf', '.zip']):
+            continue
+            
+        # Check if source already exists
+        cursor.execute("SELECT 1 FROM discovered_sources WHERE url = ?", (link,))
+        if cursor.fetchone():
+            continue
+            
+        # Determine source type
+        source_type = "unknown"
+        if "reddit.com" in link:
+            source_type = "reddit"
+        elif "arxiv.org" in link:
+            source_type = "arxiv"
+        elif "github.com" in link:
+            source_type = "github"
+        elif "substack.com" in link:
+            source_type = "substack"
+        elif "medium.com" in link:
+            source_type = "medium"
+        elif "ycombinator.com" in link:
+            source_type = "hackernews"
+        elif "twitter.com" in link:
+            source_type = "twitter"
+            
+        # Add new source
+        cursor.execute("""
+            INSERT INTO discovered_sources 
+            (url, source_type, discovery_method, parent_url, quality_score)
+            VALUES (?, ?, ?, ?, ?)
+        """, (link, source_type, "link_follow", url, 1.0))
+    
+    conn.commit()
     conn.close()
-    return False
-
 
 def extract_article_text(url):
     try:
@@ -112,18 +95,13 @@ def extract_article_text(url):
         except Exception:
             return ""
 
-
 def post_exists(conn, post_id):
     cursor = conn.cursor()
     cursor.execute("SELECT 1 FROM posts WHERE id = ?", (post_id,))
     exists = cursor.fetchone() is not None
     return exists
 
-
 def save_post(conn, post):
-    if should_block_content(post["url"], post["source"]):
-        logger.warning(f"Blocked penalized content: {post['url']}")
-        return
     cursor = conn.cursor()
     cursor.execute(
         """
@@ -142,31 +120,6 @@ def save_post(conn, post):
         ),
     )
     conn.commit()
-
-
-def scrape_targeted_sources():
-    conn = sqlite3.connect(DATABASE)
-
-    # Rotate through categories to ensure coverage
-    category = random.choice(list(INTEREST_CONFIG["categories"].keys()))
-    sources = TARGETED_SOURCES[category]
-
-    print(f"Scraping sources for category: {category}")
-    print(sources)
-
-    for source in sources:
-        if "ycombinator" in source:
-            scrape_hacker_news(conn, limit=10)
-        elif "reddit" in source:
-            subreddit = source.split("/")[-2] if "/" in source else "all"
-            scrape_reddit_subreddit(conn, subreddit=subreddit, limit=10)
-        elif "arxiv" in source:
-            scrape_arxiv(conn)
-        elif "indiehackers" in source:
-            scrape_indie_hackers(conn)
-
-    conn.close()
-
 
 def scrape_hacker_news(conn, limit=30):
     with sync_playwright() as p:
@@ -411,7 +364,105 @@ def scrape_indie_hackers(conn):
             save_post(conn, post_data)
             print(f"Saved Indie Hackers post: {title[:60]}...")
 
+def scrape_source(url, source_type):
+    """Scrape content from a specific source"""
+    conn = get_db_connection()
+    logger.info(f"Scraping source: {url}")
+    
+    if "ycombinator" in url:
+        scrape_hacker_news(conn)
+    elif "reddit" in url:
+        subreddit = url.split("/")[-2] if "/" in url else "all"
+        scrape_reddit_subreddit(conn, subreddit=subreddit)
+    elif "arxiv" in url:
+        scrape_arxiv(conn)
+    elif "indiehackers" in url:
+        scrape_indie_hackers(conn)
+    else:
+        # Generic webpage scraping
+        try:
+            res = requests.get(url, headers=HEADERS, timeout=15)
+            if res.status_code != 200:
+                logger.warning(f"Failed to fetch {url}: {res.status_code}")
+                return
+                
+            soup = BeautifulSoup(res.text, "html.parser")
+            articles = soup.find_all("article") or soup.select(".post, .article, .entry")
+            
+            for article in articles[:10]:  # Limit to 10 articles per page
+                title_elem = article.find(["h1", "h2", "h3"])
+                link_elem = article.find("a", href=True)
+                
+                if not title_elem or not link_elem:
+                    continue
+                    
+                title = title_elem.text.strip()
+                link = link_elem["href"]
+                
+                if not link.startswith("http"):
+                    link = url + link
+                    
+                post_id = hashlib.md5(link.encode()).hexdigest()
+                
+                if post_exists(conn, post_id):
+                    continue
+                    
+                content = extract_article_text(link)
+                
+                post = {
+                    "id": post_id,
+                    "title": title,
+                    "url": link,
+                    "content": content,
+                    "source": source_type,
+                    "created_at": datetime.datetime.utcnow(),
+                }
+                
+                save_post(conn, post)
+                logger.info(f"Saved post: {title[:60]}...")
+                
+                # Discover new sources from content
+                if content:
+                    discover_new_sources(url, content)
+        except Exception as e:
+            logger.error(f"Error scraping {url}: {str(e)}")
+    
+    conn.close()
+
+def scrape_active_sources():
+    """Scrape all active sources in rotation"""
+    conn = get_db_connection()
+    cursor = conn.cursor()
+    
+    # Get active sources ordered by quality and last crawled
+    cursor.execute("""
+        SELECT url, source_type 
+        FROM discovered_sources 
+        WHERE is_active = 1
+        ORDER BY quality_score DESC, last_crawled ASC
+        LIMIT 5
+    """)
+    
+    sources = cursor.fetchall()
+    conn.close()
+    
+    for url, source_type in sources:
+        scrape_source(url, source_type)
+        
+        # Update last_crawled timestamp
+        conn = get_db_connection()
+        cursor = conn.cursor()
+        cursor.execute("""
+            UPDATE discovered_sources 
+            SET last_crawled = ?
+            WHERE url = ?
+        """, (datetime.datetime.utcnow().isoformat(), url))
+        conn.commit()
+        conn.close()
+
+# (Keep existing Hacker News, Reddit, Arxiv, and Indie Hackers scraping functions from original)
+# They should be modified to call discover_new_sources() after saving each post
 
 if __name__ == "__main__":
-    # Run targeted scraping
-    scrape_targeted_sources()
+    # Run scraping of active sources
+    scrape_active_sources()

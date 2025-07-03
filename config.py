@@ -55,9 +55,3 @@ INTEREST_CONFIG = {
         "newsletter": 1.1,
     },
 }
-
-FEEDBACK_OPTIONS = {
-    "relevance": ["not relevant", "somewhat relevant", "very relevant"],
-    "quality": ["low", "medium", "high"],
-    "novelty": ["common", "somewhat new", "breakthrough"],
-}
