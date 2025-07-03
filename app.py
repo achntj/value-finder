@@ -1,6 +1,7 @@
 # app.py
 import streamlit as st
 import sqlite3
+import pandas as pd
 from datetime import datetime
 import subprocess
 import time
@@ -137,211 +138,288 @@ def record_feedback(post_id, feedback_type, original_score, conn):
     
     conn.commit()
 
+def show_database_explorer(conn):
+    """Show database tables and their contents"""
+    st.header("Database Explorer")
+    st.info("View and explore the internal database tables")
+    
+    # Get list of all tables
+    cursor = conn.cursor()
+    cursor.execute("SELECT name FROM sqlite_master WHERE type='table'")
+    tables = [row[0] for row in cursor.fetchall()]
+    
+    selected_table = st.selectbox("Select Table", tables)
+    
+    # Show table schema
+    st.subheader(f"Schema: `{selected_table}`")
+    cursor.execute(f"PRAGMA table_info({selected_table})")
+    schema = cursor.fetchall()
+    
+    if schema:
+        schema_df = pd.DataFrame(schema, columns=["cid", "name", "type", "notnull", "dflt_value", "pk"])
+        st.dataframe(schema_df[["name", "type", "notnull", "pk"]])
+    else:
+        st.warning(f"No schema found for table: {selected_table}")
+    
+    # Show table data
+    st.subheader(f"Data: `{selected_table}`")
+    try:
+        cursor.execute(f"SELECT * FROM {selected_table}")
+        data = cursor.fetchall()
+        
+        if data:
+            # Get column names
+            column_names = [description[0] for description in cursor.description]
+            df = pd.DataFrame(data, columns=column_names)
+            
+            # Format datetime columns
+            for col in df.columns:
+                if any(time_key in col.lower() 
+                       for time_key in ['timestamp', 'created_at', 'last_updated']):
+                    try:
+                        # First try ISO format
+                        df[col] = pd.to_datetime(df[col], format='ISO8601')
+                    except:
+                        # Then try space-separated format
+                        df[col] = pd.to_datetime(df[col], format='%Y-%m-%d %H:%M:%S', errors='coerce')
+            
+            st.dataframe(df)
+            
+            # Show statistics
+            st.subheader("Table Statistics")
+            col1, col2 = st.columns(2)
+            col1.metric("Total Rows", len(df))
+            
+            # Special handling for certain tables
+            if selected_table == "posts":
+                col2.metric("High Value Posts", df['is_high_value'].sum())
+            elif selected_table == "discovered_sources":
+                col2.metric("Active Sources", df['is_active'].sum())
+            elif selected_table == "learning_feedback":
+                feedback_counts = df['feedback_type'].value_counts()
+                col2.metric("False Positives", feedback_counts.get('false_positive', 0))
+                
+        else:
+            st.info(f"No data found in table: {selected_table}")
+            
+    except Exception as e:
+        st.error(f"Error loading table data: {str(e)}")
+
 def main():
     st.set_page_config(page_title="Value Crawler", layout="wide", page_icon="💎")
-    st.title("💎 Value Crawler - Goldmines from the Web")
-
+    
+    # Navigation
+    st.sidebar.title("Navigation")
+    app_mode = st.sidebar.radio("Select View", 
+                                ["💎 Content Explorer", "🔍 Database Explorer"])
+    
     conn = get_db_connection()
-    debug_info = debug_database(conn)
+    
+    if app_mode == "💎 Content Explorer":
+        st.title("💎 Value Crawler - Goldmines from the Web")
+        debug_info = debug_database(conn)
 
-    with st.sidebar:
-        st.header("🔧 Controls")
-        if st.button("⏱️ Reset Scheduler"):
-            reset_scheduler()
-        if st.button("🧹 Cleanup Database"):
-            cleanup_database()
+        with st.sidebar:
+            st.header("🔧 Controls")
+            if st.button("⏱️ Reset Scheduler"):
+                reset_scheduler()
+            if st.button("🧹 Cleanup Database"):
+                cleanup_database()
 
-        # Debug Info Section
-        st.header("📊 System Status")
-        if not debug_info["status"]:
-            st.error("Database issues detected!")
-            for msg in debug_info["messages"]:
-                st.error(msg)
-        else:
-            st.success("System healthy")
-            col1, col2 = st.columns(2)
-            col1.metric("Total Posts", debug_info["stats"]["total_posts"])
-            col2.metric("High Value", debug_info["stats"]["high_value_posts"])
-            col1.metric("With Feedback", debug_info["stats"]["feedback_posts"])
-            col2.metric("Active Sources", debug_info["stats"]["active_sources"])
+            # Debug Info Section
+            st.header("📊 System Status")
+            if not debug_info["status"]:
+                st.error("Database issues detected!")
+                for msg in debug_info["messages"]:
+                    st.error(msg)
+            else:
+                st.success("System healthy")
+                col1, col2 = st.columns(2)
+                col1.metric("Total Posts", debug_info["stats"]["total_posts"])
+                col2.metric("High Value", debug_info["stats"]["high_value_posts"])
+                col1.metric("With Feedback", debug_info["stats"]["feedback_posts"])
+                col2.metric("Active Sources", debug_info["stats"]["active_sources"])
+                
+                # Learning metrics
+                st.subheader("🧠 Learning Stats")
+                col1, col2 = st.columns(2)
+                col1.metric("False Positives", debug_info["stats"]["false_positives"])
+                col2.metric("False Negatives", debug_info["stats"]["false_negatives"])
+
+            # Filters Section
+            st.header("🔍 Filters")
+            selected_categories = st.multiselect(
+                "Categories",
+                options=list(CATEGORY_MAP.keys()),
+                default=list(CATEGORY_MAP.keys()),
+            )
+            sources = st.multiselect(
+                "Sources",
+                options=list(INTEREST_CONFIG["source_weights"].keys()),
+                default=list(INTEREST_CONFIG["source_weights"].keys()),
+            )
+
+        # Main content area with two tabs
+        tab1, tab2 = st.tabs(["💎 High Value Content", "🔍 Low Ranked Content (Learning)"])
+
+        # Convert selected display names to internal topics
+        selected_topics = [CATEGORY_MAP[name] for name in selected_categories]
+
+        with tab1:
+            st.header("💎 High Value Content")
+            st.caption("Content the AI thinks is valuable - mark as 👎 if wrong to improve learning")
             
-            # Learning metrics
-            st.subheader("🧠 Learning Stats")
-            col1, col2 = st.columns(2)
-            col1.metric("False Positives", debug_info["stats"]["false_positives"])
-            col2.metric("False Negatives", debug_info["stats"]["false_negatives"])
+            # Build query for high-value content
+            query = """
+                SELECT p.id, p.title, p.url, p.summary, p.value_score, p.novelty_score, p.interest_score,
+                       p.source, p.topic, p.user_feedback 
+                FROM posts p
+                WHERE p.is_high_value = 1
+            """
+            params = []
 
-        # Filters Section
-        st.header("🔍 Filters")
-        selected_categories = st.multiselect(
-            "Categories",
-            options=list(CATEGORY_MAP.keys()),
-            default=list(CATEGORY_MAP.keys()),
-        )
-        sources = st.multiselect(
-            "Sources",
-            options=list(INTEREST_CONFIG["source_weights"].keys()),
-            default=list(INTEREST_CONFIG["source_weights"].keys()),
-        )
+            if sources:
+                query += " AND p.source IN (" + ",".join(["?"] * len(sources)) + ")"
+                params.extend(sources)
 
-    # Main content area with two tabs
-    tab1, tab2 = st.tabs(["💎 High Value Content", "🔍 Low Ranked Content (Learning)"])
+            if selected_topics:
+                query += " AND p.topic IN (" + ",".join(["?"] * len(selected_topics)) + ")"
+                params.extend(selected_topics)
 
-    # Convert selected display names to internal topics
-    selected_topics = [CATEGORY_MAP[name] for name in selected_categories]
+            query += " ORDER BY p.value_score DESC LIMIT 50"
 
-    with tab1:
-        st.header("💎 High Value Content")
-        st.caption("Content the AI thinks is valuable - mark as 👎 if wrong to improve learning")
-        
-        # Build query for high-value content
-        query = """
-            SELECT p.id, p.title, p.url, p.summary, p.value_score, p.novelty_score, p.interest_score,
-                   p.source, p.topic, p.user_feedback 
-            FROM posts p
-            WHERE p.is_high_value = 1
-        """
-        params = []
+            cursor = conn.cursor()
+            cursor.execute(query, params)
+            high_value_posts = cursor.fetchall()
 
-        if sources:
-            query += " AND p.source IN (" + ",".join(["?"] * len(sources)) + ")"
-            params.extend(sources)
-
-        if selected_topics:
-            query += " AND p.topic IN (" + ",".join(["?"] * len(selected_topics)) + ")"
-            params.extend(selected_topics)
-
-        query += " ORDER BY p.value_score DESC LIMIT 50"
-
-        cursor = conn.cursor()
-        cursor.execute(query, params)
-        high_value_posts = cursor.fetchall()
-
-        if not high_value_posts:
-            st.warning("No high-value posts match your filters")
-        else:
-            for post in high_value_posts:
-                (post_id, title, url, summary, value_score, novelty_score, 
-                 interest_score, source, topic, user_feedback) = post
-                
-                # Convert internal topic to display name
-                display_topic = next(
-                    (name for name, cat in CATEGORY_MAP.items() if cat == topic), topic
-                )
-
-                # Color coding based on feedback
-                if user_feedback == 'negative' or user_feedback == 'false_positive':
-                    header_icon = "❌"
-                    header_color = "red"
-                elif user_feedback == 'positive':
-                    header_icon = "✅"
-                    header_color = "green"
-                else:
-                    header_icon = "💎"
-                    header_color = "blue"
+            if not high_value_posts:
+                st.warning("No high-value posts match your filters")
+            else:
+                for post in high_value_posts:
+                    (post_id, title, url, summary, value_score, novelty_score, 
+                     interest_score, source, topic, user_feedback) = post
                     
-                with st.expander(
-                    f"{header_icon} {title} (Value: {value_score:.3f}, Novel: {novelty_score:.3f}, Interest: {interest_score:.3f})",
-                    expanded=False
-                ):                
-                    col1, col2 = st.columns([4, 1])
-                    with col1:
-                        st.markdown(f"**Source:** {source} | **Topic:** {display_topic}")
-                        if summary:
-                            st.markdown(f"**Summary:** {summary}")
-                        st.markdown(f"[Read more]({url})")
-                    with col2:
-                        if not user_feedback:
-                            if st.button("👍", key=f"pos_{post_id}", help="This is valuable"):
-                                record_feedback(post_id, 'positive', value_score, conn)
-                                st.success("✅ Marked as valuable!")
-                                time.sleep(0.5)
-                                st.rerun()
-                            if st.button("👎", key=f"neg_{post_id}", help="This is not valuable"):
-                                record_feedback(post_id, 'false_positive', value_score, conn)
-                                st.error("❌ Marked as false positive - will learn!")
-                                time.sleep(0.5)
-                                st.rerun()
-                        else:
-                            st.markdown(f"<span style='color:{header_color}'>Feedback recorded!</span>", 
-                                unsafe_allow_html=True)
+                    # Convert internal topic to display name
+                    display_topic = next(
+                        (name for name, cat in CATEGORY_MAP.items() if cat == topic), topic
+                    )
+
+                    # Color coding based on feedback
+                    if user_feedback == 'negative' or user_feedback == 'false_positive':
+                        header_icon = "❌"
+                        header_color = "red"
+                    elif user_feedback == 'positive':
+                        header_icon = "✅"
+                        header_color = "green"
+                    else:
+                        header_icon = "💎"
+                        header_color = "blue"
+                        
+                    with st.expander(
+                        f"{header_icon} {title} (Value: {value_score:.3f}, Novel: {novelty_score:.3f}, Interest: {interest_score:.3f})",
+                        expanded=False
+                    ):                
+                        col1, col2 = st.columns([4, 1])
+                        with col1:
+                            st.markdown(f"**Source:** {source} | **Topic:** {display_topic}")
+                            if summary:
+                                st.markdown(f"**Summary:** {summary}")
+                            st.markdown(f"[Read more]({url})")
+                        with col2:
+                            if not user_feedback:
+                                if st.button("👍", key=f"pos_{post_id}", help="This is valuable"):
+                                    record_feedback(post_id, 'positive', value_score, conn)
+                                    st.success("✅ Marked as valuable!")
+                                    time.sleep(0.5)
+                                    st.rerun()
+                                if st.button("👎", key=f"neg_{post_id}", help="This is not valuable"):
+                                    record_feedback(post_id, 'false_positive', value_score, conn)
+                                    st.error("❌ Marked as false positive - will learn!")
+                                    time.sleep(0.5)
+                                    st.rerun()
+                            else:
+                                st.markdown(f"<span style='color:{header_color}'>Feedback recorded!</span>", 
+                                    unsafe_allow_html=True)
 
 
-    with tab2:
-        st.header("🔍 Low Ranked Content (Learning View)")
-        st.caption("Content the AI ranked low - mark as 👍 if valuable to improve discovery")
-        
-        # Build query for low-value content
-        query = """
-            SELECT p.id, p.title, p.url, p.summary, p.value_score, p.novelty_score, p.interest_score,
-                   p.source, p.topic, p.user_feedback, p.is_high_value
-            FROM posts p
-            WHERE p.is_high_value = 0
-        """
-        params = []
+        with tab2:
+            st.header("🔍 Low Ranked Content (Learning View)")
+            st.caption("Content the AI ranked low - mark as 👍 if valuable to improve discovery")
+            
+            # Build query for low-value content
+            query = """
+                SELECT p.id, p.title, p.url, p.summary, p.value_score, p.novelty_score, p.interest_score,
+                       p.source, p.topic, p.user_feedback, p.is_high_value
+                FROM posts p
+                WHERE p.is_high_value = 0
+            """
+            params = []
 
-        if sources:
-            query += " AND p.source IN (" + ",".join(["?"] * len(sources)) + ")"
-            params.extend(sources)
+            if sources:
+                query += " AND p.source IN (" + ",".join(["?"] * len(sources)) + ")"
+                params.extend(sources)
 
-        if selected_topics:
-            query += " AND p.topic IN (" + ",".join(["?"] * len(selected_topics)) + ")"
-            params.extend(selected_topics)
+            if selected_topics:
+                query += " AND p.topic IN (" + ",".join(["?"] * len(selected_topics)) + ")"
+                params.extend(selected_topics)
 
-        query += " ORDER BY p.value_score DESC LIMIT 100"
+            query += " ORDER BY p.value_score DESC LIMIT 100"
 
-        cursor.execute(query, params)
-        all_posts = cursor.fetchall()
+            cursor.execute(query, params)
+            all_posts = cursor.fetchall()
 
-        if not all_posts:
-            st.warning("No posts match your filters")
-        else:
-            for post in all_posts:
-                (post_id, title, url, summary, value_score, novelty_score, 
-                 interest_score, source, topic, user_feedback, is_high_value) = post
-                
-                # Convert internal topic to display name
-                display_topic = next(
-                    (name for name, cat in CATEGORY_MAP.items() if cat == topic), topic
-                )
+            if not all_posts:
+                st.warning("No posts match your filters")
+            else:
+                for post in all_posts:
+                    (post_id, title, url, summary, value_score, novelty_score, 
+                     interest_score, source, topic, user_feedback, is_high_value) = post
+                    
+                    # Convert internal topic to display name
+                    display_topic = next(
+                        (name for name, cat in CATEGORY_MAP.items() if cat == topic), topic
+                    )
 
-                # Different styling based on value and feedback
-                if user_feedback == 'negative' or user_feedback == 'false_positive':
-                    header_icon = "❌"
-                    header_color = "red"
-                elif user_feedback == 'positive':
-                    header_icon = "✅"
-                    header_color = "green"
-                else:
-                    header_icon = "🔍"
-                    header_color = "blue"
-                with st.expander(
-                    f"{header_icon} {title} (Value: {value_score:.3f}, Novel: {novelty_score:.3f}, Interest: {interest_score:.3f})",
-                    expanded=False
-                ):                
-                    col1, col2 = st.columns([4, 1])
-                    with col1:
-                        st.markdown(f"**Source:** {source} | **Topic:** {display_topic}")
-                        if summary:
-                            st.markdown(f"**Summary:** {summary}")
-                        st.markdown(f"[Read more]({url})")
-                    with col2:
-                        if not user_feedback:
-                            if st.button("👍", key=f"pos_all_{post_id}", help="This is valuable"):
-                                feedback_type = 'false_negative'
-                                record_feedback(post_id, feedback_type, value_score, conn)
-                                st.success("✅ Marked as valuable!")
-                                time.sleep(0.5)
-                                st.rerun()
-                            if st.button("👎", key=f"neg_all_{post_id}", help="This is not valuable"):
-                                feedback_type = 'negative'
-                                record_feedback(post_id, feedback_type, value_score, conn)
-                                st.error("❌ Marked as not valuable!")
-                                time.sleep(0.5)
-                                st.rerun()
-                        else:
-                            st.markdown(f"<span style='color:{header_color}'>Feedback recorded!</span>", 
-                                unsafe_allow_html=True)
+                    # Different styling based on value and feedback
+                    if user_feedback == 'negative' or user_feedback == 'false_positive':
+                        header_icon = "❌"
+                        header_color = "red"
+                    elif user_feedback == 'positive':
+                        header_icon = "✅"
+                        header_color = "green"
+                    else:
+                        header_icon = "🔍"
+                        header_color = "blue"
+                    with st.expander(
+                        f"{header_icon} {title} (Value: {value_score:.3f}, Novel: {novelty_score:.3f}, Interest: {interest_score:.3f})",
+                        expanded=False
+                    ):                
+                        col1, col2 = st.columns([4, 1])
+                        with col1:
+                            st.markdown(f"**Source:** {source} | **Topic:** {display_topic}")
+                            if summary:
+                                st.markdown(f"**Summary:** {summary}")
+                            st.markdown(f"[Read more]({url})")
+                        with col2:
+                            if not user_feedback:
+                                if st.button("👍", key=f"pos_all_{post_id}", help="This is valuable"):
+                                    feedback_type = 'false_negative'
+                                    record_feedback(post_id, feedback_type, value_score, conn)
+                                    st.success("✅ Marked as valuable!")
+                                    time.sleep(0.5)
+                                    st.rerun()
+                                if st.button("👎", key=f"neg_all_{post_id}", help="This is not valuable"):
+                                    feedback_type = 'negative'
+                                    record_feedback(post_id, feedback_type, value_score, conn)
+                                    st.error("❌ Marked as not valuable!")
+                                    time.sleep(0.5)
+                                    st.rerun()
+                            else:
+                                st.markdown(f"<span style='color:{header_color}'>Feedback recorded!</span>", 
+                                    unsafe_allow_html=True)
+    
+    elif app_mode == "🔍 Database Explorer":
+        show_database_explorer(conn)
 
     conn.close()
 

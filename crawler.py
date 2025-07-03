@@ -10,7 +10,7 @@ import random
 from config import INTEREST_CONFIG
 import logging
 import re
-import hashlib  # For generating consistent IDs
+import hashlib
 from urllib.parse import urljoin  # For resolving relative URLs
 
 # Configure logging
@@ -31,45 +31,59 @@ def discover_new_sources(url, content):
     conn = get_db_connection()
     cursor = conn.cursor()
     
-    # Find all links in content
-    links = re.findall(r'href="(https?://[^"]+)"', content)
-    
-    for link in links:
-        # Filter out non-content links
-        if any(ext in link for ext in ['.png', '.jpg', '.jpeg', '.gif', '.pdf', '.zip']):
-            continue
-            
-        # Check if source already exists
-        cursor.execute("SELECT 1 FROM discovered_sources WHERE url = ?", (link,))
-        if cursor.fetchone():
-            continue
-            
-        # Determine source type
-        source_type = "unknown"
-        if "reddit.com" in link:
-            source_type = "reddit"
-        elif "arxiv.org" in link:
-            source_type = "arxiv"
-        elif "github.com" in link:
-            source_type = "github"
-        elif "substack.com" in link:
-            source_type = "substack"
-        elif "medium.com" in link:
-            source_type = "medium"
-        elif "ycombinator.com" in link:
-            source_type = "hackernews"
-        elif "twitter.com" in link:
-            source_type = "twitter"
-            
-        # Add new source
-        cursor.execute("""
-            INSERT INTO discovered_sources 
-            (url, source_type, discovery_method, parent_url, quality_score)
-            VALUES (?, ?, ?, ?, ?)
-        """, (link, source_type, "link_follow", url, 1.0))
-    
-    conn.commit()
-    conn.close()
+    try:
+        soup = BeautifulSoup(content, "html.parser")
+        links = set()
+        for a in soup.find_all("a", href=True):
+            href = a["href"]
+            # Resolve relative URLs
+            absolute_url = urljoin(url, href)
+            # Filter out non-http links
+            if not absolute_url.startswith("http"):
+                continue
+            # Normalize URL
+            normalized_url = absolute_url.split('#')[0].split('?')[0]
+            links.add(normalized_url)
+        
+        for link in links:
+            # Filter out non-content links
+            if any(ext in link for ext in ['.png', '.jpg', '.jpeg', '.gif', '.pdf', '.zip', '.css', '.js']):
+                continue
+                
+            # Check if source already exists
+            cursor.execute("SELECT 1 FROM discovered_sources WHERE url = ?", (link,))
+            if cursor.fetchone():
+                continue
+                
+            # Determine source type
+            source_type = "unknown"
+            if "reddit.com" in link:
+                source_type = "reddit"
+            elif "arxiv.org" in link:
+                source_type = "arxiv"
+            elif "github.com" in link:
+                source_type = "github"
+            elif "substack.com" in link:
+                source_type = "substack"
+            elif "medium.com" in link:
+                source_type = "medium"
+            elif "ycombinator.com" in link:
+                source_type = "hackernews"
+            elif "twitter.com" in link:
+                source_type = "twitter"
+                
+            # Add new source
+            cursor.execute("""
+                INSERT OR IGNORE INTO discovered_sources 
+                (url, source_type, discovery_method, parent_url, quality_score)
+                VALUES (?, ?, ?, ?, ?)
+            """, (link, source_type, "link_follow", url, 1.0))
+        
+        conn.commit()
+    except Exception as e:
+        logger.error(f"Discovery failed for {url}: {str(e)}")
+    finally:
+        conn.close()
 
 def extract_article_text(url):
     try:
@@ -121,135 +135,154 @@ def save_post(conn, post):
     )
     conn.commit()
 
-def scrape_hacker_news(conn, limit=30):
-    with sync_playwright() as p:
-        browser = p.firefox.launch(headless=True)
-        page = browser.new_page()
-        page.goto("https://news.ycombinator.com/")
-        posts_fetched = 0
+def scrape_hacker_news(limit=30):
+    conn = get_db_connection()
+    try:
+        with sync_playwright() as p:
+            browser = p.firefox.launch(headless=True)
+            page = browser.new_page()
+            page.goto("https://news.ycombinator.com/")
+            
+            # Capture page content for source discovery
+            page_content = page.content()
+            discover_new_sources("https://news.ycombinator.com", page_content)
+            
+            posts_fetched = 0
+            items = page.query_selector_all("tr.athing")
+            for item in items:
+                if posts_fetched >= limit:
+                    break
 
-        items = page.query_selector_all("tr.athing")
-        for item in items:
-            if posts_fetched >= limit:
-                break
+                post_id = item.get_attribute("id")
+                if not post_id or post_exists(conn, post_id):
+                    continue
 
-            post_id = item.get_attribute("id")
-            if not post_id or post_exists(conn, post_id):
-                continue
+                title_link = item.query_selector(".titleline a")
+                if not title_link:
+                    continue
 
-            title_link = item.query_selector(".titleline a")
-            if not title_link:
-                continue
+                title = title_link.inner_text().strip()
+                external_url = title_link.get_attribute("href")
+                hn_comments_url = f"https://news.ycombinator.com/item?id={post_id}"
 
-            title = title_link.inner_text().strip()
-            external_url = title_link.get_attribute("href")
-            hn_comments_url = f"https://news.ycombinator.com/item?id={post_id}"
+                article_text = (
+                    extract_article_text(external_url)
+                    if external_url.startswith("http")
+                    else ""
+                )
 
-            article_text = (
-                extract_article_text(external_url)
-                if external_url.startswith("http")
-                else ""
-            )
+                if not article_text:
+                    article_text = extract_article_text(hn_comments_url)
 
-            if not article_text:
-                article_text = extract_article_text(hn_comments_url)
+                content = title + "\n\n" + article_text.strip()
 
-            content = title + "\n\n" + article_text.strip()
+                post = {
+                    "id": post_id,
+                    "title": title,
+                    "url": (
+                        external_url if external_url.startswith("http") else hn_comments_url
+                    ),
+                    "content": content,
+                    "source": "hackernews",
+                    "created_at": datetime.datetime.utcnow(),
+                }
 
-            post = {
-                "id": post_id,
-                "title": title,
-                "url": (
-                    external_url if external_url.startswith("http") else hn_comments_url
-                ),
-                "content": content,
-                "source": "hackernews",
-                "created_at": datetime.datetime.utcnow(),
-            }
+                save_post(conn, post)
+                posts_fetched += 1
+                logger.info(f"Saved HN post: {title[:60]}...")
 
-            save_post(conn, post)
-            posts_fetched += 1
-            print(f"Saved HN post: {title[:60]}...")
+            browser.close()
+            logger.info(f"Finished scraping {posts_fetched} Hacker News posts.")
+    finally:
+        conn.close()
 
-        browser.close()
-        print(f"Finished scraping {posts_fetched} Hacker News posts.")
-
-
-def scrape_reddit_subreddit(conn, subreddit="all", limit=20):
-    print(f"Scraping Reddit r/{subreddit}...")
+def scrape_reddit_subreddit(subreddit="all", limit=20):
+    logger.info(f"Scraping Reddit r/{subreddit}...")
     url = f"https://old.reddit.com/r/{subreddit}/"
     fetched = 0
 
-    while fetched < limit and url:
-        res = requests.get(url, headers=HEADERS)
-        if res.status_code != 200:
-            print(f"Error fetching Reddit: {res.status_code}")
-            break
-
-        soup = BeautifulSoup(res.text, "html.parser")
-        entries = soup.find_all("div", class_="thing")
-
-        for entry in entries:
-            if fetched >= limit:
+    conn = get_db_connection()
+    try:
+        while fetched < limit and url:
+            res = requests.get(url, headers=HEADERS)
+            if res.status_code != 200:
+                logger.error(f"Error fetching Reddit: {res.status_code}")
                 break
 
-            post_id = entry.get("data-fullname")
-            if not post_id or post_exists(conn, post_id):
-                continue
+            # Discover sources from page content
+            discover_new_sources(url, res.text)
+                
+            soup = BeautifulSoup(res.text, "html.parser")
+            entries = soup.find_all("div", class_="thing")
 
-            title_tag = entry.find("a", class_="title")
-            if not title_tag:
-                continue
+            for entry in entries:
+                if fetched >= limit:
+                    break
 
-            title = title_tag.text.strip()
-            post_url = entry.get("data-url")
-            if post_url and post_url.startswith("/"):
-                post_url = "https://old.reddit.com" + post_url
+                post_id = entry.get("data-fullname")
+                if not post_id or post_exists(conn, post_id):
+                    continue
 
-            selftext_div = entry.find("div", class_="expando")
-            snippet = (
-                selftext_div.text.strip()[:500]
-                if selftext_div and selftext_div.text.strip()
-                else ""
-            )
+                title_tag = entry.find("a", class_="title")
+                if not title_tag:
+                    continue
 
-            article_text = (
-                extract_article_text(post_url)
-                if post_url and post_url.startswith("http")
-                else ""
-            )
+                title = title_tag.text.strip()
+                post_url = entry.get("data-url")
+                if post_url and post_url.startswith("/"):
+                    post_url = "https://old.reddit.com" + post_url
 
-            content = title + "\n\n" + snippet
-            if article_text:
-                content += "\n\n" + article_text
+                selftext_div = entry.find("div", class_="expando")
+                snippet = (
+                    selftext_div.text.strip()[:500]
+                    if selftext_div and selftext_div.text.strip()
+                    else ""
+                )
 
-            post = {
-                "id": post_id,
-                "title": title,
-                "url": post_url if post_url else "",
-                "content": content,
-                "source": "reddit",
-                "created_at": datetime.datetime.utcnow(),
-            }
+                article_text = (
+                    extract_article_text(post_url)
+                    if post_url and post_url.startswith("http")
+                    else ""
+                )
 
-            save_post(conn, post)
-            fetched += 1
-            print(f"Saved Reddit post: {title[:60]}...")
+                content = title + "\n\n" + snippet
+                if article_text:
+                    content += "\n\n" + article_text
 
-        next_btn = soup.find("span", class_="next-button")
-        url = next_btn.a["href"] if next_btn else None
-        time.sleep(2)  # Be polite
+                post = {
+                    "id": post_id,
+                    "title": title,
+                    "url": post_url if post_url else "",
+                    "content": content,
+                    "source": "reddit",
+                    "created_at": datetime.datetime.utcnow(),
+                }
 
-    print(f"Finished scraping Reddit, fetched {fetched} posts.")
+                save_post(conn, post)
+                fetched += 1
+                logger.info(f"Saved Reddit post: {title[:60]}...")
 
+            next_btn = soup.find("span", class_="next-button")
+            url = next_btn.a["href"] if next_btn else None
+            time.sleep(2)  # Be polite
 
-def scrape_arxiv(conn):
+        logger.info(f"Finished scraping Reddit, fetched {fetched} posts.")
+    finally:
+        conn.close()
+
+def scrape_arxiv():
     logger.info("Scraping arXiv for AI papers...")
     url = "https://arxiv.org/list/cs.AI/recent"
+    conn = get_db_connection()
     try:
         res = requests.get(url, headers=HEADERS, timeout=15)
-        res.raise_for_status()
-
+        if res.status_code != 200:
+            logger.error(f"Failed to fetch arXiv: {res.status_code}")
+            return
+            
+        # Discover sources from page content
+        discover_new_sources(url, res.text)
+            
         soup = BeautifulSoup(res.text, "html.parser")
         papers = soup.select("dt + dd")  # Get all dd elements following dt
 
@@ -322,62 +355,65 @@ def scrape_arxiv(conn):
             except Exception as e:
                 logger.error(f"Error processing arXiv paper: {str(e)}")
                 continue
+    finally:
+        conn.close()
 
-    except Exception as e:
-        logger.error(f"Failed to scrape arXiv: {str(e)}")
-
-
-def scrape_indie_hackers(conn):
-    print("Scraping Indie Hackers...")
+def scrape_indie_hackers():
+    logger.info("Scraping Indie Hackers...")
     url = "https://www.indiehackers.com/"
-    res = requests.get(url, headers=HEADERS)
+    conn = get_db_connection()
+    try:
+        res = requests.get(url, headers=HEADERS)
+        if res.status_code != 200:
+            logger.error(f"Error fetching Indie Hackers: {res.status_code}")
+            return
+            
+        # Discover sources from page content
+        discover_new_sources(url, res.text)
+            
+        soup = BeautifulSoup(res.text, "html.parser")
+        posts = soup.find_all("div", class_="feed-item")
 
-    if res.status_code != 200:
-        print(f"Error fetching Indie Hackers: {res.status_code}")
-        return
+        for post in posts[:10]:  # Limit to 10 posts
+            title_tag = post.find("a", class_="feed-item__title")
+            if not title_tag:
+                continue
 
-    soup = BeautifulSoup(res.text, "html.parser")
-    posts = soup.find_all("div", class_="feed-item")
+            title = title_tag.text.strip()
+            post_url = "https://www.indiehackers.com" + title_tag["href"]
+            post_id = hashlib.md5(post_url.encode()).hexdigest()
 
-    for post in posts[:10]:  # Limit to 10 posts
-        title_tag = post.find("a", class_="feed-item__title")
-        if not title_tag:
-            continue
+            content_tag = post.find("div", class_="feed-item__content")
+            content = content_tag.text.strip() if content_tag else ""
 
-        title = title_tag.text.strip()
-        post_url = "https://www.indiehackers.com" + title_tag["href"]
-        post_id = post_url.split("/")[-1]
+            post_data = {
+                "id": post_id,
+                "title": title,
+                "url": post_url,
+                "content": f"{title}\n\n{content}",
+                "source": "indiehackers",
+                "created_at": datetime.datetime.utcnow(),
+            }
 
-        content_tag = post.find("div", class_="feed-item__content")
-        content = content_tag.text.strip() if content_tag else ""
-
-        post_data = {
-            "id": post_id,
-            "title": title,
-            "url": post_url,
-            "content": f"{title}\n\n{content}",
-            "source": "indiehackers",
-            "created_at": datetime.datetime.utcnow(),
-        }
-
-        if not post_exists(conn, post_id):
-            save_post(conn, post_data)
-            print(f"Saved Indie Hackers post: {title[:60]}...")
+            if not post_exists(conn, post_id):
+                save_post(conn, post_data)
+                logger.info(f"Saved Indie Hackers post: {title[:60]}...")
+    finally:
+        conn.close()
 
 def scrape_source(url, source_type):
     """Scrape content from a specific source"""
-    conn = get_db_connection()
     logger.info(f"Scraping source: {url}")
     
     if "ycombinator" in url:
-        scrape_hacker_news(conn)
+        scrape_hacker_news()
     elif "reddit" in url:
         subreddit = url.split("/")[-2] if "/" in url else "all"
-        scrape_reddit_subreddit(conn, subreddit=subreddit)
+        scrape_reddit_subreddit(subreddit=subreddit)
     elif "arxiv" in url:
-        scrape_arxiv(conn)
+        scrape_arxiv()
     elif "indiehackers" in url:
-        scrape_indie_hackers(conn)
+        scrape_indie_hackers()
     else:
         # Generic webpage scraping
         try:
@@ -386,65 +422,73 @@ def scrape_source(url, source_type):
                 logger.warning(f"Failed to fetch {url}: {res.status_code}")
                 return
                 
+            # Discover sources from main page
+            discover_new_sources(url, res.text)
+            
             soup = BeautifulSoup(res.text, "html.parser")
             articles = soup.find_all("article") or soup.select(".post, .article, .entry")
             
-            for article in articles[:10]:  # Limit to 10 articles per page
-                title_elem = article.find(["h1", "h2", "h3"])
-                link_elem = article.find("a", href=True)
-                
-                if not title_elem or not link_elem:
-                    continue
+            conn = get_db_connection()
+            try:
+                for article in articles[:10]:  # Limit to 10 articles per page
+                    title_elem = article.find(["h1", "h2", "h3"])
+                    link_elem = article.find("a", href=True)
                     
-                title = title_elem.text.strip()
-                link = link_elem["href"]
-                
-                if not link.startswith("http"):
-                    link = url + link
+                    if not title_elem or not link_elem:
+                        continue
+                        
+                    title = title_elem.text.strip()
+                    link = link_elem["href"]
                     
-                post_id = hashlib.md5(link.encode()).hexdigest()
-                
-                if post_exists(conn, post_id):
-                    continue
+                    if not link.startswith("http"):
+                        link = urljoin(url, link)
+                        
+                    post_id = hashlib.md5(link.encode()).hexdigest()
                     
-                content = extract_article_text(link)
-                
-                post = {
-                    "id": post_id,
-                    "title": title,
-                    "url": link,
-                    "content": content,
-                    "source": source_type,
-                    "created_at": datetime.datetime.utcnow(),
-                }
-                
-                save_post(conn, post)
-                logger.info(f"Saved post: {title[:60]}...")
-                
-                # Discover new sources from content
-                if content:
-                    discover_new_sources(url, content)
+                    if post_exists(conn, post_id):
+                        continue
+                        
+                    content = extract_article_text(link)
+                    
+                    post = {
+                        "id": post_id,
+                        "title": title,
+                        "url": link,
+                        "content": content,
+                        "source": source_type,
+                        "created_at": datetime.datetime.utcnow(),
+                    }
+                    
+                    save_post(conn, post)
+                    logger.info(f"Saved post: {title[:60]}...")
+                    
+                    # Discover new sources from content
+                    if content:
+                        discover_new_sources(url, content)
+            finally:
+                conn.close()
         except Exception as e:
             logger.error(f"Error scraping {url}: {str(e)}")
-    
-    conn.close()
 
 def scrape_active_sources():
     """Scrape all active sources in rotation"""
+    logger.info("Scraping active sources...")
     conn = get_db_connection()
     cursor = conn.cursor()
     
-    # Get active sources ordered by quality and last crawled
-    cursor.execute("""
-        SELECT url, source_type 
-        FROM discovered_sources 
-        WHERE is_active = 1
-        ORDER BY quality_score DESC, last_crawled ASC
-        LIMIT 5
-    """)
-    
-    sources = cursor.fetchall()
-    conn.close()
+    try:
+        # Get active sources ordered by quality and last crawled
+        cursor.execute("""
+            SELECT url, source_type 
+            FROM discovered_sources 
+            WHERE is_active = 1
+            ORDER BY quality_score DESC, last_crawled ASC
+            LIMIT 5
+        """)
+        
+        sources = cursor.fetchall()
+    finally:
+        conn.close()
     
     for url, source_type in sources:
         scrape_source(url, source_type)
@@ -452,16 +496,18 @@ def scrape_active_sources():
         # Update last_crawled timestamp
         conn = get_db_connection()
         cursor = conn.cursor()
-        cursor.execute("""
-            UPDATE discovered_sources 
-            SET last_crawled = ?
-            WHERE url = ?
-        """, (datetime.datetime.utcnow().isoformat(), url))
-        conn.commit()
-        conn.close()
-
-# (Keep existing Hacker News, Reddit, Arxiv, and Indie Hackers scraping functions from original)
-# They should be modified to call discover_new_sources() after saving each post
+        try:
+            cursor.execute("""
+                UPDATE discovered_sources 
+                SET last_crawled = ?
+                WHERE url = ?
+            """, (datetime.datetime.utcnow().isoformat(), url))
+            conn.commit()
+        finally:
+            conn.close()
+        
+        # Be polite between sources
+        time.sleep(random.uniform(1, 3))
 
 if __name__ == "__main__":
     # Run scraping of active sources
