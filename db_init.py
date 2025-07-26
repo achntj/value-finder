@@ -1,17 +1,33 @@
 # db_init.py
 import sqlite3
 from datetime import datetime
+import logging
+
+# Configure logging
+logging.basicConfig(
+    level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s"
+)
+logger = logging.getLogger(__name__)
+
 
 def initialize_database():
     """Initialize all database tables with proper schema if they don't exist"""
-    conn = sqlite3.connect("database.db")
+    conn = sqlite3.connect("database.db", timeout=30)  # Increased timeout
     cursor = conn.cursor()
+
+    # Enable WAL mode for better concurrency
+    try:
+        cursor.execute("PRAGMA journal_mode=WAL;")
+        logger.info("Enabled SQLite WAL mode for better concurrency")
+    except Exception as e:
+        logger.error(f"Failed to enable WAL mode: {str(e)}")
 
     # Enable foreign key constraints
     cursor.execute("PRAGMA foreign_keys = ON")
 
     # Posts table (main content storage)
-    cursor.execute("""
+    cursor.execute(
+        """
     CREATE TABLE IF NOT EXISTS posts (
         id TEXT PRIMARY KEY,
         title TEXT NOT NULL,
@@ -31,16 +47,18 @@ def initialize_database():
         last_updated TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
         CHECK (is_high_value IN (0, 1))
     )
-    """)
+    """
+    )
 
-    # Source discovery and tracking (updated with quality management)
-    cursor.execute("""
+    # Source discovery and tracking (updated with freshness tracking)
+    cursor.execute(
+        """
     CREATE TABLE IF NOT EXISTS discovered_sources (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
         url TEXT UNIQUE NOT NULL,
         source_type TEXT NOT NULL,  -- 'rss', 'webpage', 'reddit', 'twitter', etc.
         discovery_method TEXT,      -- 'crawl', 'link_follow', 'recommendation'
-        parent_url TEXT,           -- URL where this source was discovered
+        parent_url TEXT,            -- URL where this source was discovered
         quality_score REAL DEFAULT 1.0,
         estimated_quality BOOLEAN DEFAULT 1,  -- 1=estimated, 0=actual
         last_quality_update TIMESTAMP,
@@ -48,12 +66,15 @@ def initialize_database():
         crawl_count INTEGER DEFAULT 0,
         is_active BOOLEAN DEFAULT 1,
         discovered_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+        freshness_score REAL DEFAULT 1.0,  -- Track content freshness
         CHECK (is_active IN (0, 1))
     )
-    """)
+    """
+    )
 
     # Learning from user feedback
-    cursor.execute("""
+    cursor.execute(
+        """
     CREATE TABLE IF NOT EXISTS learning_feedback (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
         post_id TEXT NOT NULL,
@@ -64,10 +85,12 @@ def initialize_database():
         timestamp TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
         FOREIGN KEY(post_id) REFERENCES posts(id) ON DELETE CASCADE
     )
-    """)
+    """
+    )
 
     # Source reliability tracking (enhanced)
-    cursor.execute("""
+    cursor.execute(
+        """
     CREATE TABLE IF NOT EXISTS source_penalties (
         source TEXT PRIMARY KEY,
         penalty_score REAL NOT NULL DEFAULT 1.0,
@@ -77,18 +100,22 @@ def initialize_database():
         high_value_posts INTEGER DEFAULT 0,
         CHECK (penalty_score BETWEEN 0.0 AND 1.0)
     )
-    """)
+    """
+    )
 
     # Scheduler state tracking
-    cursor.execute("""
+    cursor.execute(
+        """
     CREATE TABLE IF NOT EXISTS scheduler_state (
         task_name TEXT PRIMARY KEY,
         last_run TIMESTAMP NOT NULL
     )
-    """)
+    """
+    )
 
     # Interest profile weights (enhanced for learning) - UPDATED
-    cursor.execute("""
+    cursor.execute(
+        """
     CREATE TABLE IF NOT EXISTS interest_profile (
         category TEXT PRIMARY KEY,
         current_weight REAL NOT NULL,
@@ -98,10 +125,12 @@ def initialize_database():
         last_updated TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
         boost_factor REAL DEFAULT 1.0  -- NEW COLUMN ADDED
     )
-    """)
+    """
+    )
 
     # Content features for machine learning
-    cursor.execute("""
+    cursor.execute(
+        """
     CREATE TABLE IF NOT EXISTS content_features (
         post_id TEXT PRIMARY KEY,
         word_count INTEGER,
@@ -112,10 +141,12 @@ def initialize_database():
         uniqueness_score REAL,
         FOREIGN KEY(post_id) REFERENCES posts(id) ON DELETE CASCADE
     )
-    """)
+    """
+    )
 
     # Link discovery tracking
-    cursor.execute("""
+    cursor.execute(
+        """
     CREATE TABLE IF NOT EXISTS link_discovery (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
         source_url TEXT NOT NULL,
@@ -126,20 +157,25 @@ def initialize_database():
         timestamp TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
         CHECK (explored IN (0, 1))
     )
-    """)
+    """
+    )
 
     # Initialize interest profile weights from config
     from config import INTEREST_CONFIG
+
     # Initialize interest profile weights with boost factors
     for category, config in INTEREST_CONFIG["categories"].items():
         # Add boost factor to category config
         config["boost"] = config.get("boost", 1.0)  # Default to 1.0 if not set
-        
-        cursor.execute("""
+
+        cursor.execute(
+            """
         INSERT OR IGNORE INTO interest_profile 
         (category, current_weight, boost_factor)
         VALUES (?, ?, ?)
-        """, (category, config["weight"], config["boost"]))
+        """,
+            (category, config["weight"], config["boost"]),
+        )
 
     # Initialize some high-quality seed sources
     seed_sources = [
@@ -150,44 +186,70 @@ def initialize_database():
         ("https://astralcodexten.substack.com/", "webpage", "seed"),
         ("https://www.stratechery.com/", "webpage", "seed"),
     ]
-    
+
     for url, source_type, method in seed_sources:
-        cursor.execute("""
+        cursor.execute(
+            """
         INSERT OR IGNORE INTO discovered_sources 
-        (url, source_type, discovery_method, quality_score)
-        VALUES (?, ?, ?, ?)
-        """, (url, source_type, method, 1.2))
+        (url, source_type, discovery_method, quality_score, freshness_score)
+        VALUES (?, ?, ?, ?, ?)
+        """,
+            (url, source_type, method, 1.2, 1.0),
+        )
 
     # Create indexes for better performance
-    cursor.execute("""
+    cursor.execute(
+        """
     CREATE INDEX IF NOT EXISTS idx_posts_value_score ON posts(value_score)
-    """)
-    cursor.execute("""
+    """
+    )
+    cursor.execute(
+        """
     CREATE INDEX IF NOT EXISTS idx_posts_high_value ON posts(is_high_value)
-    """)
-    cursor.execute("""
+    """
+    )
+    cursor.execute(
+        """
     CREATE INDEX IF NOT EXISTS idx_posts_topic ON posts(topic)
-    """)
-    cursor.execute("""
+    """
+    )
+    cursor.execute(
+        """
     CREATE INDEX IF NOT EXISTS idx_posts_source ON posts(source)
-    """)
-    cursor.execute("""
+    """
+    )
+    cursor.execute(
+        """
     CREATE INDEX IF NOT EXISTS idx_posts_feedback ON posts(user_feedback)
-    """)
-    cursor.execute("""
+    """
+    )
+    cursor.execute(
+        """
     CREATE INDEX IF NOT EXISTS idx_discovered_sources_active ON discovered_sources(is_active)
-    """)
-    cursor.execute("""
+    """
+    )
+    cursor.execute(
+        """
     CREATE INDEX IF NOT EXISTS idx_learning_feedback_type ON learning_feedback(feedback_type)
-    """)
-    cursor.execute("""
+    """
+    )
+    cursor.execute(
+        """
     CREATE INDEX IF NOT EXISTS idx_link_discovery_explored ON link_discovery(explored)
-    """)
+    """
+    )
+    # NEW: Index for discovered_sources freshness
+    cursor.execute(
+        """
+    CREATE INDEX IF NOT EXISTS idx_discovered_sources_freshness ON discovered_sources(freshness_score)
+    """
+    )
 
     conn.commit()
     conn.close()
-    print("Database initialization complete - all tables verified/created")
+    logger.info("Database initialization complete - all tables verified/created")
+
 
 if __name__ == "__main__":
     initialize_database()
-    print("Database initialized successfully")
+    logger.info("Database initialized successfully")

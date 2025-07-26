@@ -22,7 +22,7 @@ class EmbeddingIndexer:
         cursor = self.conn.cursor()
         cursor.execute(
             """
-            SELECT id, summary, score FROM posts 
+            SELECT id, summary, value_score FROM posts 
             WHERE summary IS NOT NULL
             ORDER BY score DESC
             LIMIT 1000  # Only index top content

@@ -12,9 +12,11 @@ MAX_TOKENS = 3000
 SUMMARY_CACHE = {}  # In-memory cache to avoid reprocessing
 LIMIT = 25
 
+
 def get_content_hash(content):
     """Generate consistent hash for content"""
     return hashlib.md5(content.encode()).hexdigest()
+
 
 def summarize(text):
     """Summarize text with caching"""
@@ -36,8 +38,9 @@ def summarize(text):
         SUMMARY_CACHE[content_hash] = summary  # Cache result
         return summary
     except Exception as e:
-        print(f"❌ Error summarizing: {e}")
+        print(f"Error summarizing: {e}")
         return None
+
 
 def summarize_high_value():
     """Summarize high-value content only"""
@@ -53,10 +56,12 @@ def summarize_high_value():
         AND content IS NOT NULL
         ORDER BY value_score DESC
         LIMIT ?
-    """, (LIMIT,))
+    """,
+        (LIMIT,),
+    )
     rows = cursor.fetchall()
 
-    print(f"📝 Summarizing {len(rows)} high-value posts...")
+    print(f"Summarizing {len(rows)} high-value posts...")
 
     for idx, (post_id, content) in enumerate(rows):
         print(f"[{idx+1}/{len(rows)}] Summarizing post: {post_id}")
@@ -74,7 +79,8 @@ def summarize_high_value():
         time.sleep(0.3)  # Small pause to avoid hammering Ollama
 
     conn.close()
-    print("✅ High-value summarization complete.")
+    print("High-value summarization complete.")
+
 
 if __name__ == "__main__":
     summarize_high_value()
